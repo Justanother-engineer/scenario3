@@ -3,7 +3,7 @@ param(
 )
 
 # -- CONFIG --
-$scriptBase = "https://raw.githubusercontent.com/Justanother-engineer/scenario3/main/src"
+$scriptBase = "https://raw.githubusercontent.com/Justanother-engineer/scenario3/main"
 
 # -- Elevation Gate --
 $isAdmin = [Security.Principal.WindowsPrincipal]::new(
