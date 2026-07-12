@@ -3,7 +3,7 @@ param(
 )
 
 # -- CONFIG --
-$scriptBase = "https://raw.githubusercontent.com/Justanother-engineer/scenario3/main"
+$scriptBase = "https://raw.githubusercontent.com/Justanother-engineer/scenario3/main/src"
 $cleanupUrl = "$scriptBase/cleanup.ps1"
 
 # -- Logging --
