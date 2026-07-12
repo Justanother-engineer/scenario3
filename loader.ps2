@@ -260,6 +260,11 @@ $artifacts = @{
     "T1041 HTTP exfil (github.com)"      = "log:T1041"
     "T1074.001 staging scatter"          = "C:\ProgramData\Microsoft\cache\tray\net.tmp"
     "T1018 remote system discovery"      = "C:\ProgramData\Microsoft\cache\tray\net.tmp"
+    "T1087 account discovery"            = "log:T1087"
+    "T1082 system info discovery"        = "log:T1082"
+    "T1053.005 scheduled task"           = "log:T1053"
+    "T1070.001 event log query"          = "log:T1070.001"
+    "T1113 screen capture"               = "log:T1113"
 }
 
 function Test-Artifact {
