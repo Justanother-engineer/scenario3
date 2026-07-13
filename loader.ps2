@@ -280,7 +280,10 @@ function Test-Artifact {
     param([string]$Path)
     if ($Path -like 'log:*') {
         $needle = $Path.Substring(4)
-        return [bool](Select-String -Path $logFile -Pattern ([regex]::Escape($needle)) -SimpleMatch -ErrorAction SilentlyContinue)
+        # ponytail: -SimpleMatch does literal substring search; pairing it with
+        # [regex]::Escape would search for the literal '\.' in T1070.001 and miss
+        # the log line. Pass the bare needle.
+        return [bool](Select-String -Path $logFile -Pattern $needle -SimpleMatch -ErrorAction SilentlyContinue)
     }
     return (Test-Path -LiteralPath $Path)
 }
