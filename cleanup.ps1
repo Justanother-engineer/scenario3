@@ -24,7 +24,9 @@ Write-Host "[*] Running with admin privileges."
 
 $ErrorActionPreference = "SilentlyContinue"
 
-$cleanupLog = "C:\ProgramData\Microsoft\cache\tray\cleanup.dat"
+# ponytail: artifacts are scattered across system dirs (see loader.ps2 CONFIG).
+# cleanup sweeps each explicit file + the scatter dirs, then user-profile .govinda.
+$cleanupLog = "C:\Windows\Temp\cleanup.dat"
 function Write-CleanupLog($msg) {
     $parent = Split-Path $cleanupLog -Parent
     if (-not (Test-Path $parent)) { New-Item -Path $parent -ItemType Directory -Force | Out-Null }
@@ -34,16 +36,37 @@ function Write-CleanupLog($msg) {
 Write-Host "[*] Cleaning up scenario-03 artifacts..."
 Write-CleanupLog "[*] cleanup.ps1 started - logFile=$cleanupLog"
 
-# 1. Delete staging files
-$stagingDir = "C:\ProgramData\Microsoft\cache\tray"
-Write-CleanupLog "[*] Scanning $stagingDir"
-if (Test-Path $stagingDir) {
-    Get-ChildItem -Path $stagingDir -File -ErrorAction SilentlyContinue | ForEach-Object {
+# 1. Delete scattered staging files
+$scatterFiles = @(
+    "C:\Windows\Temp\cache.dat",
+    "C:\Windows\Temp\boot-ok.flag",
+    "C:\Users\Public\Documents\payload.hta",
+    "C:\Windows\System32\loader.dll",
+    "C:\Windows\SysWOW64\stage2.dll",
+    "C:\ProgramData\Microsoft\Diagnosis\net.tmp"
+)
+$scatterDirs = @(
+    "C:\ProgramData\Microsoft\Diagnosis"
+)
+foreach ($f in $scatterFiles) {
+    if (Test-Path -LiteralPath $f) {
         if ($WhatIf) {
-            Write-CleanupLog "[WHATIF] would delete $($_.FullName)"
+            Write-CleanupLog "[WHATIF] would delete $f"
         } else {
-            Remove-Item -Path $_.FullName -Force
-            Write-CleanupLog "[-] Deleted: $($_.FullName)"
+            Remove-Item -LiteralPath $f -Force
+            Write-CleanupLog "[-] Deleted: $f"
+        }
+    }
+}
+foreach ($d in $scatterDirs) {
+    if (Test-Path -LiteralPath $d) {
+        if ($WhatIf) {
+            Write-CleanupLog "[WHATIF] would sweep $d"
+        } else {
+            Get-ChildItem -Path $d -File -ErrorAction SilentlyContinue | ForEach-Object {
+                Remove-Item -LiteralPath $_.FullName -Force
+                Write-CleanupLog "[-] Deleted: $($_.FullName)"
+            }
         }
     }
 }
@@ -92,11 +115,7 @@ if (Test-Path $tempLoader) {
 Write-CleanupLog ""
 Write-CleanupLog "[*] Residual verification"
 $residFiles = @()
-$residualPaths = @(
-    $stagingDir,
-    $notePath,
-    $tempLoader
-)
+$residualPaths = @($scatterFiles) + @($notePath) + @($tempLoader)
 foreach ($p in $residualPaths) {
     if (Test-Path -LiteralPath $p) { $residFiles += $p }
 }
