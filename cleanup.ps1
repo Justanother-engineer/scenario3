@@ -71,7 +71,7 @@ foreach ($d in $scatterDirs) {
     }
 }
 
-# 2. Delete .govinda files from user profile
+# 2. Delete .govinda files from user profile + system scatter dirs
 Write-CleanupLog "[*] Scanning for .govinda files"
 $profileDirs = @("Desktop", "Documents", "Pictures", "Downloads")
 foreach ($dir in $profileDirs) {
@@ -82,6 +82,26 @@ foreach ($dir in $profileDirs) {
                 Write-CleanupLog "[WHATIF] would delete $($_.FullName)"
             } else {
                 Remove-Item -Path $_.FullName -Force
+                Write-CleanupLog "[-] Deleted .govinda: $($_.FullName)"
+            }
+        }
+    }
+}
+
+# 2b. Sweep additional scatter dirs touched by stage2 synthetic-drop fallback
+$govindaScatterDirs = @(
+    [Environment]::GetFolderPath("CommonDocuments"),
+    "C:\ProgramData\Microsoft\Diagnosis",
+    "C:\Windows\Temp",
+    $env:TEMP
+)
+foreach ($gdir in $govindaScatterDirs) {
+    if ($gdir -and (Test-Path -LiteralPath $gdir)) {
+        Get-ChildItem -LiteralPath $gdir -Filter "*.govinda" -ErrorAction SilentlyContinue | ForEach-Object {
+            if ($WhatIf) {
+                Write-CleanupLog "[WHATIF] would delete $($_.FullName)"
+            } else {
+                Remove-Item -LiteralPath $_.FullName -Force
                 Write-CleanupLog "[-] Deleted .govinda: $($_.FullName)"
             }
         }

