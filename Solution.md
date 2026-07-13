@@ -50,9 +50,9 @@ This document lists every MITRE ATT&CK technique exercised by the scenario, in t
 - **Detection:** Sysmon EID 10 — `VirtualProtect` + `WriteProcessMemory` to `ntdll.dll` code section.
 
 ### T1055.012 — Process Injection: Process Hollowing
-- **What:** `loader.dll` creates `svchost.exe` suspended, unmaps its original image via `NtUnmapViewOfSection`, allocates memory, writes `stage2.dll` PE headers + sections, sets thread context to entry point, and resumes.
-- **Where:** `loader.c:79-153` (Hollow function)
-- **Detection:** Sysmon EID 1 — `svchost.exe` created suspended; EID 10 — `VirtualAllocEx` + `WriteProcessMemory` + `SetThreadContext`. No EID 8 (`CreateRemoteThread`).
+- **What:** `loader.dll` creates `svchost.exe` suspended, unmaps its original image via `NtUnmapViewOfSection`, allocates memory, writes `stage2.dll` PE headers + sections, sets thread context to entry point, and resumes. IAT resolved by loading each dependency DLL *in the loader host process* and writing `GetProcAddress` results to the remote IAT — this works because system DLLs share a base across processes per boot (system-wide ASLR), and avoids `CreateRemoteThread` which Win11 24H2 rejects on a CREATE_SUSPENDED, not-yet-initialized hollowed child (error 998).
+- **Where:** `loader.c:175-331` (Hollow function)
+- **Detection:** Sysmon EID 1 — `svchost.exe` created suspended; EID 10 — `VirtualAllocEx` + `WriteProcessMemory` + `SetThreadContext`. No EID 8 (`CreateRemoteThread`) — IAT is resolved by `LoadLibrary`+`GetProcAddress` in the hollowing host, not via remote-thread injection.
 
 ### T1055.012 — Process Injection: PPID Spoofing
 - **What:** `spoof.cs::SpawnWithParent` uses `PROC_THREAD_ATTRIBUTE_PARENT_PROCESS` to make `mshta.exe` inherit `explorer.exe`'s handle as the parent. Process tree shows `explorer.exe → mshta.exe`.
@@ -61,7 +61,7 @@ This document lists every MITRE ATT&CK technique exercised by the scenario, in t
 
 ### T1036.005 — Masquerading: System Process Spoofing
 - **What:** The payload runs inside a hollowed `svchost.exe` — a legitimate Windows system process.
-- **Where:** `loader.c:79-153` (svchost hollowing)
+- **Where:** `loader.c:175-331` (svchost hollowing)
 - **Detection:** Sysmon EID 1 — `svchost.exe` with unusual parent (rundll32.exe instead of services.exe).
 
 ### T1070.006 — Indicator Removal: Timestomping
@@ -71,7 +71,7 @@ This document lists every MITRE ATT&CK technique exercised by the scenario, in t
 
 ### T1564.003 — Hide Artifacts: Hidden Window
 - **What:** All child processes are spawned with `SW_HIDE` / `CREATE_NO_WINDOW` / `-WindowStyle Hidden`.
-- **Where:** `loader.ps2:159` (`-WindowStyle Hidden`); `loader.c:88` (`CREATE_NO_WINDOW`); `payload.hta:81,98` (`WScript.Shell.Run` with window style 0)
+- **Where:** `loader.ps2:159` (`-WindowStyle Hidden`); `loader.c:194` (`CREATE_SUSPENDED` — hollowed svchost has no UI thread before stage2's DllMain runs); `payload.hta:81,98` (`WScript.Shell.Run` with window style 0)
 - **Detection:** Sysmon EID 1 — child processes spawned with no window.
 
 ### T1027 — Obfuscated Files or Information
@@ -190,3 +190,4 @@ This document lists every MITRE ATT&CK technique exercised by the scenario, in t
 - **T1486 (data encrypted)** does NOT destroy originals — it creates `.govinda` encrypted copies. Ransom note dropped for SOC visibility.
 - **T1490 (volume shadow copy deletion)** is the most destructive step; vssadmin may not exist on all Windows SKUs, so a synthetic fallback is logged.
 - **Fallback paths** (non-domain lateral recon, synthetic `.govinda` if no documents, synthetic beacon if no network) ensure artifacts land even on edge cases. See `idea.md` for the full fallback matrix.
+- **Win11 24H2 / Tiny11 fix** — process hollowing uses local-side IAT resolution (`LoadLibrary` + `GetProcAddress` in `loader.dll`'s host) rather than remote-thread injection, so it works on Windows 11 24H2 / Tiny11 where `CreateRemoteThread` against a suspended-and-hollowed child is rejected with `ERROR_NOACCESS` (998). The trade-off is that all stage2 dependencies must be system DLLs (system-wide ASLR); a non-system dependency would require manual remote mapping.

